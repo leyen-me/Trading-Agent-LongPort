@@ -29,6 +29,16 @@ from tools import (
     BaseTool,
     QuoteCandlesticksTool,
     QuoteRealtimeTool,
+    TradeAccountBalanceTool,
+    TradeCancelOrderTool,
+    TradeEstimateBuyLimitTool,
+    TradeHistoryOrdersTool,
+    TradeOrderDetailTool,
+    TradeReplaceOrderTool,
+    TradeStockPositionsTool,
+    TradeStopOrderTool,
+    TradeSubmitOrderTool,
+    TradeTodayOrdersTool,
 )
 
 
@@ -259,6 +269,16 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <tool>quote_candlesticks</tool>
     <tool>quote_history_candlesticks</tool>
     <tool>quote_watchlist_groups</tool>
+    <tool>trade_estimate_buy_limit</tool>
+    <tool>trade_history_orders</tool>
+    <tool>trade_order_detail</tool>
+    <tool>trade_replace_order</tool>
+    <tool>trade_submit_order</tool>
+    <tool>trade_today_orders</tool>
+    <tool>trade_cancel_order</tool>
+    <tool>trade_stop_order</tool>
+    <tool>trade_account_balance</tool>
+    <tool>trade_stock_positions</tool>
   </available_tools>
 
   <completion_rules>
@@ -1515,6 +1535,17 @@ class ExecuteAgent(BaseAgent):
         self.register_tool(TaskUpdateTool(task_store))
         self.register_tool(QuoteRealtimeTool(lambda: quote_ctx))
         self.register_tool(QuoteCandlesticksTool(lambda: quote_ctx))
+        tp = lambda: trade_ctx
+        self.register_tool(TradeEstimateBuyLimitTool(tp))
+        self.register_tool(TradeHistoryOrdersTool(tp))
+        self.register_tool(TradeOrderDetailTool(tp))
+        self.register_tool(TradeReplaceOrderTool(tp))
+        self.register_tool(TradeSubmitOrderTool(tp))
+        self.register_tool(TradeTodayOrdersTool(tp))
+        self.register_tool(TradeCancelOrderTool(tp))
+        self.register_tool(TradeStopOrderTool(tp))
+        self.register_tool(TradeAccountBalanceTool(tp))
+        self.register_tool(TradeStockPositionsTool(tp))
 
     def reset_conversation(self) -> None:
         """重置上下文与当前任务运行期状态。"""
@@ -1573,9 +1604,14 @@ def parse_cli_args() -> argparse.Namespace:
         help="运行 LongPort 行情工具集成烟测后退出（实现见 test/longport_quote_smoke.py）",
     )
     parser.add_argument(
+        "--test-trade",
+        action="store_true",
+        help="运行 LongPort 交易工具集成烟测后退出（只读接口，见 test/longport_trade_smoke.py）",
+    )
+    parser.add_argument(
         "--test-full",
         action="store_true",
-        help="与 --test 联用：结果 JSON 不截断（分时等数据可能很长）",
+        help="与 --test / --test-trade 联用：结果 JSON 不截断",
     )
     return parser.parse_args()
 
@@ -1598,7 +1634,11 @@ def main() -> None:
 if __name__ == "__main__":
     cli_args = parse_cli_args()
     if cli_args.test:
-        from test.longport_quote_smoke import run_integration_tests
+        from test.longport_quote_smoke import run_integration_tests as run_quote_tests
 
-        sys.exit(run_integration_tests(test_full=cli_args.test_full))
+        sys.exit(run_quote_tests(test_full=cli_args.test_full))
+    if cli_args.test_trade:
+        from test.longport_trade_smoke import run_integration_tests as run_trade_tests
+
+        sys.exit(run_trade_tests(test_full=cli_args.test_full))
     main()

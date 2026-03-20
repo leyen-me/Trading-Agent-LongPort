@@ -41,6 +41,22 @@ from tools import (
     TradeTodayOrdersTool,
 )
 
+# PlanAgent 仅注册只读 LongPort 工具；ExecuteAgent = 只读 + 下列改单类
+_PLAN_READ_ONLY_TRADE_TOOL_CLASSES = (
+    TradeAccountBalanceTool,
+    TradeEstimateBuyLimitTool,
+    TradeHistoryOrdersTool,
+    TradeOrderDetailTool,
+    TradeStockPositionsTool,
+    TradeTodayOrdersTool,
+)
+_EXECUTE_MUTATING_TRADE_TOOL_CLASSES = (
+    TradeCancelOrderTool,
+    TradeReplaceOrderTool,
+    TradeSubmitOrderTool,
+    TradeStopOrderTool,
+)
+
 
 # ==== 日志配置 ====
 
@@ -215,11 +231,20 @@ PLAN_AGENT_SYSTEM_PROMPT = """
   <hard_constraints>
     <rule>你只能直接调用自己已注册的工具。</rule>
     <rule>不要重复创建已存在的任务，不要反复规划同一件事。</rule>
+    <rule>你只能使用只读工具查询行情、资金、持仓与订单信息；不得下单、改单、撤单或提交条件/止损单。任何会改变交易状态的操作必须写入任务，由 ExecuteAgent 执行。</rule>
   </hard_constraints>
 
   <available_tools>
     <tool>task_plan</tool>
     <tool>execute_next_task</tool>
+    <tool>quote_realtime</tool>
+    <tool>quote_candlesticks</tool>
+    <tool>trade_account_balance</tool>
+    <tool>trade_estimate_buy_limit</tool>
+    <tool>trade_history_orders</tool>
+    <tool>trade_order_detail</tool>
+    <tool>trade_stock_positions</tool>
+    <tool>trade_today_orders</tool>
   </available_tools>
 
   <tool_call_policy>
@@ -260,25 +285,20 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
   </hard_constraints>
 
   <available_tools>
-    <tool>sleep</tool>
     <tool>read_tasks</tool>
     <tool>update_task</tool>
-    <tool>quote_static_info</tool>
     <tool>quote_realtime</tool>
-    <tool>quote_intraday</tool>
     <tool>quote_candlesticks</tool>
-    <tool>quote_history_candlesticks</tool>
-    <tool>quote_watchlist_groups</tool>
+    <tool>trade_account_balance</tool>
     <tool>trade_estimate_buy_limit</tool>
     <tool>trade_history_orders</tool>
     <tool>trade_order_detail</tool>
+    <tool>trade_stock_positions</tool>
+    <tool>trade_today_orders</tool>
     <tool>trade_replace_order</tool>
     <tool>trade_submit_order</tool>
-    <tool>trade_today_orders</tool>
     <tool>trade_cancel_order</tool>
     <tool>trade_stop_order</tool>
-    <tool>trade_account_balance</tool>
-    <tool>trade_stock_positions</tool>
   </available_tools>
 
   <completion_rules>
@@ -1427,7 +1447,7 @@ class PlanAgent(BaseAgent):
     """负责理解需求、拆解任务并驱动执行流程。"""
     """
     1. 与用户直接交互的 PlanAgent， 用户不会直接与 ExecuteAgent 交互
-    2. 理解用户需求，使用工具查看环境、项目等结构。做出规划。 并生成任务列表。
+    2. 理解用户需求，使用只读工具查看行情、资金与持仓等。做出规划并生成任务列表。
     3. 分配任务给 ExecuteAgent 执行。
     4. ExecuteAgent 执行任务，直到子任务完成。并反馈任务进度。
     5. 当子任务完成时，PlanAgent 主动汇报任务完成情况。
@@ -1468,6 +1488,12 @@ class PlanAgent(BaseAgent):
                 request_input_provider=lambda: self.current_user_request_input,
             )
         )
+        qp = lambda: quote_ctx
+        tp = lambda: trade_ctx
+        self.register_tool(QuoteRealtimeTool(qp))
+        self.register_tool(QuoteCandlesticksTool(qp))
+        for tool_cls in _PLAN_READ_ONLY_TRADE_TOOL_CLASSES:
+            self.register_tool(tool_cls(tp))
 
     def reset_conversation(self) -> None:
         """重置上下文，并为 PlanAgent 开启新的历史会话。"""
@@ -1533,19 +1559,14 @@ class ExecuteAgent(BaseAgent):
             )
         )
         self.register_tool(TaskUpdateTool(task_store))
-        self.register_tool(QuoteRealtimeTool(lambda: quote_ctx))
-        self.register_tool(QuoteCandlesticksTool(lambda: quote_ctx))
+        qp = lambda: quote_ctx
         tp = lambda: trade_ctx
-        self.register_tool(TradeEstimateBuyLimitTool(tp))
-        self.register_tool(TradeHistoryOrdersTool(tp))
-        self.register_tool(TradeOrderDetailTool(tp))
-        self.register_tool(TradeReplaceOrderTool(tp))
-        self.register_tool(TradeSubmitOrderTool(tp))
-        self.register_tool(TradeTodayOrdersTool(tp))
-        self.register_tool(TradeCancelOrderTool(tp))
-        self.register_tool(TradeStopOrderTool(tp))
-        self.register_tool(TradeAccountBalanceTool(tp))
-        self.register_tool(TradeStockPositionsTool(tp))
+        self.register_tool(QuoteRealtimeTool(qp))
+        self.register_tool(QuoteCandlesticksTool(qp))
+        for tool_cls in _PLAN_READ_ONLY_TRADE_TOOL_CLASSES:
+            self.register_tool(tool_cls(tp))
+        for tool_cls in _EXECUTE_MUTATING_TRADE_TOOL_CLASSES:
+            self.register_tool(tool_cls(tp))
 
     def reset_conversation(self) -> None:
         """重置上下文与当前任务运行期状态。"""
@@ -1619,26 +1640,17 @@ def parse_cli_args() -> argparse.Namespace:
 def main() -> None:
     init_longport()
     
-    # task_store = TaskStore()
-    # exec_agent = ExecuteAgent(task_store)
-    # plan_agent = PlanAgent(task_store)
-    # plan_agent.register_tool(
-    #     ExecuteNextTaskTool(
-    #         task_store,
-    #         exec_agent,
-    #         session_id_provider=lambda: plan_agent.current_session_id,
-    #     )
-    # )
-    # plan_agent.chat("你好")
+    task_store = TaskStore()
+    exec_agent = ExecuteAgent(task_store)
+    plan_agent = PlanAgent(task_store)
+    plan_agent.register_tool(
+        ExecuteNextTaskTool(
+            task_store,
+            exec_agent,
+            session_id_provider=lambda: plan_agent.current_session_id,
+        )
+    )
+    plan_agent.chat("你好，我现在还有多少钱")
 
 if __name__ == "__main__":
-    cli_args = parse_cli_args()
-    if cli_args.test:
-        from test.longport_quote_smoke import run_integration_tests as run_quote_tests
-
-        sys.exit(run_quote_tests(test_full=cli_args.test_full))
-    if cli_args.test_trade:
-        from test.longport_trade_smoke import run_integration_tests as run_trade_tests
-
-        sys.exit(run_trade_tests(test_full=cli_args.test_full))
     main()

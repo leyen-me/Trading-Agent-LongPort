@@ -335,6 +335,36 @@ def format_history_message_content(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, indent=2)
 
 
+def assistant_message_with_reasoning(
+    content: str,
+    reasoning_parts: List[str],
+    *,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """构造 assistant 消息：content 与 reasoning 分字段存储（仅持久化/上下文，见 messages_for_api）。"""
+    msg: Dict[str, Any] = {
+        "role": "assistant",
+        "content": content or "",
+    }
+    r = "".join(reasoning_parts).strip()
+    if r:
+        msg["reasoning"] = r
+    if tool_calls is not None:
+        msg["tool_calls"] = tool_calls
+    return msg
+
+
+def messages_for_api(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OpenAI Chat Completions 不接受自定义 reasoning 字段，请求前剥掉。"""
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant" and "reasoning" in m:
+            out.append({k: v for k, v in m.items() if k != "reasoning"})
+        else:
+            out.append(m)
+    return out
+
+
 def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
     """构造注入到 system prompt 中的运行时环境信息。"""
     return "\n".join(
@@ -1023,7 +1053,7 @@ class BaseAgent:
         return "".join(parts)
 
     def get_reasoning_delta_text(self, delta: Any) -> str:
-        """优先提取 reasoning_content，仅用于终端回显，不写入上下文。"""
+        """优先提取 reasoning_content；终端回显见 chat()，并会合并进 assistant content 以写入历史。"""
         for attr in ("reasoning_content", "reasoning"):
             text = self._coerce_stream_text(getattr(delta, attr, None))
             if text:
@@ -1054,7 +1084,7 @@ class BaseAgent:
         tools = self.get_tools()
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
-            "messages": self.messages,
+            "messages": [],
             "stream": True,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -1069,9 +1099,11 @@ class BaseAgent:
             api_kwargs["tool_choice"] = "auto"
 
         while True:
+            api_kwargs["messages"] = messages_for_api(self.messages)
             stream = self.client.chat.completions.create(**api_kwargs)
 
             content_parts: List[str] = []
+            reasoning_parts: List[str] = []
             tool_call_acc: Dict[str, Dict[str, str]] = {}
             last_tool_call_id: Optional[str] = None
 
@@ -1095,6 +1127,8 @@ class BaseAgent:
                 logger.info(delta)
 
                 reasoning_text = self.get_reasoning_delta_text(delta)
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
                 if reasoning_text and not silent:
                     if not reasoning_started:
                         print(
@@ -1175,11 +1209,11 @@ class BaseAgent:
                     for data in tool_call_acc.values()
                 ]
                 self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": full_content or "",
-                        "tool_calls": tool_calls_list,
-                    }
+                    assistant_message_with_reasoning(
+                        full_content,
+                        reasoning_parts,
+                        tool_calls=tool_calls_list,
+                    )
                 )
                 for call in tool_calls_list:
                     result = self.execute_tool(
@@ -1208,8 +1242,10 @@ class BaseAgent:
                     return full_content
                 continue
 
-            if full_content:
-                self.messages.append({"role": "assistant", "content": full_content})
+            if full_content or reasoning_parts:
+                self.messages.append(
+                    assistant_message_with_reasoning(full_content, reasoning_parts)
+                )
                 if not silent:
                     print()  # 流式输出后换行
                 return full_content
@@ -1609,37 +1645,49 @@ class ExecuteNextTaskTool(BaseTool):
 
 
 
-
-
 def init_longport():
     global trade_ctx, quote_ctx
     trade_ctx = TradeContext(LongPortConfig.from_env())
     quote_ctx = QuoteContext(LongPortConfig.from_env())
 
 
-def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Trading Agent (LongPort)")
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="运行 LongPort 行情工具集成烟测后退出（实现见 test/longport_quote_smoke.py）",
+def _interactive_repl(plan_agent: PlanAgent) -> None:
+    """从标准输入循环读取用户消息并交给 PlanAgent。"""
+    print_console_block(
+        "交互模式",
+        [
+            "输入你的问题后回车发送；空行忽略。",
+            "命令：/quit /exit 退出；/reset 清空本会话上下文。",
+            "EOF（Ctrl+D）也可结束。",
+        ],
     )
-    parser.add_argument(
-        "--test-trade",
-        action="store_true",
-        help="运行 LongPort 交易工具集成烟测后退出（只读接口，见 test/longport_trade_smoke.py）",
-    )
-    parser.add_argument(
-        "--test-full",
-        action="store_true",
-        help="与 --test / --test-trade 联用：结果 JSON 不截断",
-    )
-    return parser.parse_args()
+    prompt = color_text("你> ", PLAN_COLOR)
+    while True:
+        try:
+            line = input(prompt)
+        except EOFError:
+            print()
+            break
+        text = line.strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if lower in ("/quit", "/exit", "quit", "exit", "q"):
+            break
+        if lower == "/reset":
+            plan_agent.reset_conversation()
+            print(color_text("已重置会话上下文。", INFO_COLOR))
+            continue
+        try:
+            plan_agent.chat(text)
+        except KeyboardInterrupt:
+            print(color_text("\n（已中断本轮，可继续输入）", INFO_COLOR))
+            continue
 
 
 def main() -> None:
     init_longport()
-    
+
     task_store = TaskStore()
     exec_agent = ExecuteAgent(task_store)
     plan_agent = PlanAgent(task_store)
@@ -1650,7 +1698,8 @@ def main() -> None:
             session_id_provider=lambda: plan_agent.current_session_id,
         )
     )
-    plan_agent.chat("你好，我现在还有多少钱")
+    _interactive_repl(plan_agent)
+
 
 if __name__ == "__main__":
     main()

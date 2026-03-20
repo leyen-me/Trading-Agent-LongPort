@@ -13,7 +13,7 @@ class QuoteRealtimeTool(LongPortQuoteTool):
             "symbols": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "标的代码列表，例如 ['700.HK', 'AAPL.US']",
+                "description": "标的代码列表，例如 ['TSLA.US', 'AAPL.US']",
             }
         },
         "required": ["symbols"],

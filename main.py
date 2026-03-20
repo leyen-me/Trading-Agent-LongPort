@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 # 在导入 config（会校验 OPENAI_API_KEY）之前：--test / --help 不依赖真实 OpenAI
 if __name__ == "__main__" and any(
-    flag in sys.argv for flag in ("--test", "--help", "-h")
+    flag in sys.argv for flag in ("--test", "--test-full", "--help", "-h")
 ):
     os.environ.setdefault("OPENAI_API_KEY", "__LONGPORT_CLI_PLACEHOLDER__")
 
@@ -28,11 +28,7 @@ from config import Config
 from tools import (
     BaseTool,
     QuoteCandlesticksTool,
-    QuoteHistoryCandlesticksTool,
-    QuoteIntradayTool,
     QuoteRealtimeTool,
-    QuoteStaticInfoTool,
-    QuoteWatchlistGroupsTool,
 )
 
 
@@ -1517,12 +1513,8 @@ class ExecuteAgent(BaseAgent):
             )
         )
         self.register_tool(TaskUpdateTool(task_store))
-        self.register_tool(QuoteStaticInfoTool(lambda: quote_ctx))
         self.register_tool(QuoteRealtimeTool(lambda: quote_ctx))
-        self.register_tool(QuoteIntradayTool(lambda: quote_ctx))
         self.register_tool(QuoteCandlesticksTool(lambda: quote_ctx))
-        self.register_tool(QuoteHistoryCandlesticksTool(lambda: quote_ctx))
-        self.register_tool(QuoteWatchlistGroupsTool(lambda: quote_ctx))
 
     def reset_conversation(self) -> None:
         """重置上下文与当前任务运行期状态。"""
@@ -1573,68 +1565,60 @@ def init_longport():
     quote_ctx = QuoteContext(LongPortConfig.from_env())
 
 
-def run_integration_tests() -> int:
+def _format_test_output(obj: Any, *, max_chars: Optional[int]) -> str:
+    text = json.dumps(obj, ensure_ascii=False, indent=2)
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    return (
+        text[:max_chars]
+        + f"\n... （共 {len(text)} 字符，已截断；使用 python3 main.py --test --test-full 查看完整输出）"
+    )
+
+
+def run_integration_tests(*, test_full: bool = False) -> int:
     """
     LongPort 行情工具烟测：真实请求 API，需正确配置 LongPort 环境变量与行情权限。
     使用 python3 main.py --test 时，若未设置 OPENAI_API_KEY，会在导入前自动填入占位符（本烟测不调用 OpenAI）。
     """
+    max_chars = None if test_full else 16000
     print("LongPort 行情工具烟测（--test）\n")
     init_longport()
     provider = lambda: quote_ctx
     scenarios: List[tuple[str, BaseTool, Dict[str, Any]]] = [
         (
-            "quote_static_info",
-            QuoteStaticInfoTool(provider),
-            {"symbols": ["700.HK"]},
-        ),
-        (
             "quote_realtime",
             QuoteRealtimeTool(provider),
-            {"symbols": ["700.HK"]},
-        ),
-        (
-            "quote_intraday",
-            QuoteIntradayTool(provider),
-            {"symbol": "700.HK"},
+            {"symbols": ["QQQ.US"]},
         ),
         (
             "quote_candlesticks",
             QuoteCandlesticksTool(provider),
-            {"symbol": "700.HK", "period": "Day", "count": 5},
-        ),
-        (
-            "quote_history_candlesticks",
-            QuoteHistoryCandlesticksTool(provider),
-            {
-                "symbol": "700.HK",
-                "period": "Day",
-                "query_mode": "offset",
-                "forward": False,
-                "count": 3,
-            },
-        ),
-        (
-            "quote_watchlist_groups",
-            QuoteWatchlistGroupsTool(provider),
-            {},
+            {"symbol": "TSLA.US", "period": "Day", "count": 5},
         ),
     ]
 
     failed = 0
     for name, tool, params in scenarios:
+        print("=" * 72)
+        print(f"工具名: {name}")
+        print(f"参数:   {json.dumps(params, ensure_ascii=False)}")
         try:
             raw = tool.run(params)
             payload = json.loads(raw)
             if payload.get("success"):
-                print(f"[通过] {name}")
+                print("状态:   [通过]")
+                print("结果（工具返回 JSON，已按 success/data/error 结构解析）:")
+                print(_format_test_output(payload, max_chars=max_chars))
             else:
-                print(f"[失败] {name}: {payload.get('error')}")
+                print("状态:   [失败]")
+                print("结果:")
+                print(_format_test_output(payload, max_chars=max_chars))
                 failed += 1
         except Exception as exc:
-            print(f"[失败] {name}: {exc}")
+            print(f"状态:   [失败] 解析或调用异常: {exc}")
             failed += 1
+        print()
 
-    print()
     if failed:
         print(f"共 {failed} 项失败")
         return 1
@@ -1648,6 +1632,11 @@ def parse_cli_args() -> argparse.Namespace:
         "--test",
         action="store_true",
         help="运行 LongPort 行情工具集成烟测后退出",
+    )
+    parser.add_argument(
+        "--test-full",
+        action="store_true",
+        help="与 --test 联用：结果 JSON 不截断（分时等数据可能很长）",
     )
     return parser.parse_args()
 
@@ -1670,5 +1659,5 @@ def main() -> None:
 if __name__ == "__main__":
     cli_args = parse_cli_args()
     if cli_args.test:
-        sys.exit(run_integration_tests())
+        sys.exit(run_integration_tests(test_full=cli_args.test_full))
     main()

@@ -17,7 +17,7 @@ class QuoteCandlesticksTool(LongPortQuoteTool):
     parameters = {
         "type": "object",
         "properties": {
-            "symbol": {"type": "string", "description": "标的代码，例如 700.HK"},
+            "symbol": {"type": "string", "description": "标的代码，例如 TSLA.US"},
             "period": {
                 "type": "string",
                 "description": "K 线周期，例如 Day、Week、Month、Min_1、Min_5、Min_15",
@@ -25,15 +25,7 @@ class QuoteCandlesticksTool(LongPortQuoteTool):
             "count": {
                 "type": "integer",
                 "description": "返回数量，范围 1-1000",
-            },
-            "adjust_type": {
-                "type": "string",
-                "description": "复权类型，可选 NoAdjust、ForwardAdjust，默认 NoAdjust",
-            },
-            "trade_session": {
-                "type": "string",
-                "description": "可选值：Intraday、All",
-            },
+            }
         },
         "required": ["symbol", "period", "count"],
     }
@@ -44,18 +36,8 @@ class QuoteCandlesticksTool(LongPortQuoteTool):
             period = parse_period(parameters.get("period"))
             count = validate_count(parameters.get("count"))
             adjust_type = parse_adjust_type(parameters.get("adjust_type", "NoAdjust"))
-            trade_session = parse_trade_session(parameters.get("trade_session"))
             ctx = self.get_quote_context()
-            if trade_session is None:
-                rows = ctx.candlesticks(symbol, period, count, adjust_type)
-            else:
-                rows = ctx.candlesticks(
-                    symbol,
-                    period,
-                    count,
-                    adjust_type,
-                    trade_session,
-                )
+            rows = ctx.candlesticks(symbol, period, count, adjust_type)
             return self.success(pack_candlesticks(symbol, rows))
         except Exception as exc:
             return self.fail(str(exc))

@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from .LongPortQuoteTool import LongPortQuoteTool
 from utils import (
+    pack_candlesticks,
     parse_adjust_type,
     parse_period,
     parse_trade_session,
@@ -46,20 +47,15 @@ class QuoteCandlesticksTool(LongPortQuoteTool):
             trade_session = parse_trade_session(parameters.get("trade_session"))
             ctx = self.get_quote_context()
             if trade_session is None:
-                result = ctx.candlesticks(symbol, period, count, adjust_type)
+                rows = ctx.candlesticks(symbol, period, count, adjust_type)
             else:
-                result = ctx.candlesticks(
+                rows = ctx.candlesticks(
                     symbol,
                     period,
                     count,
                     adjust_type,
                     trade_session,
                 )
-            return self.success(self.serialize(result))
+            return self.success(pack_candlesticks(symbol, rows))
         except Exception as exc:
             return self.fail(str(exc))
-
-
-if __name__ == "__main__":
-    tool = QuoteCandlesticksTool()
-    print(tool.run({"symbol": "700.HK", "period": "Day", "count": 10}))

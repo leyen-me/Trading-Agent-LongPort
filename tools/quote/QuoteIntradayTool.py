@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
 from .LongPortQuoteTool import LongPortQuoteTool
-from utils import parse_trade_session, validate_symbol
+from utils import pack_intraday, parse_trade_session, validate_symbol
 
 
 class QuoteIntradayTool(LongPortQuoteTool):
@@ -28,9 +28,9 @@ class QuoteIntradayTool(LongPortQuoteTool):
             trade_session = parse_trade_session(parameters.get("trade_session"))
             ctx = self.get_quote_context()
             if trade_session is None:
-                result = ctx.intraday(symbol)
+                lines = ctx.intraday(symbol)
             else:
-                result = ctx.intraday(symbol, trade_session)
-            return self.success(self.serialize(result))
+                lines = ctx.intraday(symbol, trade_session)
+            return self.success(pack_intraday(symbol, lines))
         except Exception as exc:
             return self.fail(str(exc))

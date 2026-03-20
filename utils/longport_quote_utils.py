@@ -1,50 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from longport.openapi import AdjustType, Period, TradeSessions
-
-
-def serialize_longport_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, Enum):
-        return value.name
-    if isinstance(value, dict):
-        return {str(key): serialize_longport_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [serialize_longport_value(item) for item in value]
-
-    for method_name in ("model_dump", "dict", "_asdict"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                return serialize_longport_value(method())
-            except TypeError:
-                continue
-
-    public_attrs: Dict[str, Any] = {}
-    for attr in dir(value):
-        if attr.startswith("_"):
-            continue
-        try:
-            attr_value = getattr(value, attr)
-        except Exception:
-            continue
-        if callable(attr_value):
-            continue
-        public_attrs[attr] = serialize_longport_value(attr_value)
-
-    if public_attrs:
-        return public_attrs
-    return str(value)
 
 
 def parse_period(value: str) -> Period:

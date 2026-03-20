@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
 from .LongPortQuoteTool import LongPortQuoteTool
-from utils import validate_symbols
+from utils import pack_quotes, validate_symbols
 
 
 class QuoteRealtimeTool(LongPortQuoteTool):
@@ -23,6 +23,6 @@ class QuoteRealtimeTool(LongPortQuoteTool):
         try:
             symbols = validate_symbols(parameters.get("symbols"))
             result = self.get_quote_context().quote(symbols)
-            return self.success(self.serialize(result))
+            return self.success(pack_quotes(result))
         except Exception as exc:
             return self.fail(str(exc))

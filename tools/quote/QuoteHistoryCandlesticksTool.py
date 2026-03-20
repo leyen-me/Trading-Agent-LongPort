@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from .LongPortQuoteTool import LongPortQuoteTool
 from utils import (
+    pack_candlesticks,
     parse_adjust_type,
     parse_date,
     parse_datetime,
@@ -73,7 +74,7 @@ class QuoteHistoryCandlesticksTool(LongPortQuoteTool):
                 count = validate_count(parameters.get("count", 10))
                 anchor_time = parse_datetime(parameters.get("anchor_datetime"))
                 if trade_session is None:
-                    result = ctx.history_candlesticks_by_offset(
+                    rows = ctx.history_candlesticks_by_offset(
                         symbol,
                         period,
                         adjust_type,
@@ -82,7 +83,7 @@ class QuoteHistoryCandlesticksTool(LongPortQuoteTool):
                         anchor_time,
                     )
                 else:
-                    result = ctx.history_candlesticks_by_offset(
+                    rows = ctx.history_candlesticks_by_offset(
                         symbol,
                         period,
                         adjust_type,
@@ -91,13 +92,13 @@ class QuoteHistoryCandlesticksTool(LongPortQuoteTool):
                         anchor_time,
                         trade_session,
                     )
-                return self.success(self.serialize(result))
+                return self.success(pack_candlesticks(symbol, rows))
 
             if query_mode == "date":
                 start_date = parse_date(parameters.get("start_date"))
                 end_date = parse_date(parameters.get("end_date"))
                 if trade_session is None:
-                    result = ctx.history_candlesticks_by_date(
+                    rows = ctx.history_candlesticks_by_date(
                         symbol,
                         period,
                         adjust_type,
@@ -105,7 +106,7 @@ class QuoteHistoryCandlesticksTool(LongPortQuoteTool):
                         end_date,
                     )
                 else:
-                    result = ctx.history_candlesticks_by_date(
+                    rows = ctx.history_candlesticks_by_date(
                         symbol,
                         period,
                         adjust_type,
@@ -113,7 +114,7 @@ class QuoteHistoryCandlesticksTool(LongPortQuoteTool):
                         end_date,
                         trade_session,
                     )
-                return self.success(self.serialize(result))
+                return self.success(pack_candlesticks(symbol, rows))
 
             raise ValueError("query_mode 不合法，可选值为 offset、date")
         except Exception as exc:

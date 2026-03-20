@@ -1,8 +1,10 @@
 # standard library
+import argparse
 import json
 import logging
 import os
 import platform
+import sys
 import time
 import unicodedata
 import uuid
@@ -10,6 +12,12 @@ from dataclasses import asdict, dataclass, field
 from html import escape
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+# 在导入 config（会校验 OPENAI_API_KEY）之前：--test / --help 不依赖真实 OpenAI
+if __name__ == "__main__" and any(
+    flag in sys.argv for flag in ("--test", "--help", "-h")
+):
+    os.environ.setdefault("OPENAI_API_KEY", "__LONGPORT_CLI_PLACEHOLDER__")
 
 # third party
 from openai import OpenAI
@@ -1565,20 +1573,102 @@ def init_longport():
     quote_ctx = QuoteContext(LongPortConfig.from_env())
 
 
+def run_integration_tests() -> int:
+    """
+    LongPort 行情工具烟测：真实请求 API，需正确配置 LongPort 环境变量与行情权限。
+    使用 python3 main.py --test 时，若未设置 OPENAI_API_KEY，会在导入前自动填入占位符（本烟测不调用 OpenAI）。
+    """
+    print("LongPort 行情工具烟测（--test）\n")
+    init_longport()
+    provider = lambda: quote_ctx
+    scenarios: List[tuple[str, BaseTool, Dict[str, Any]]] = [
+        (
+            "quote_static_info",
+            QuoteStaticInfoTool(provider),
+            {"symbols": ["700.HK"]},
+        ),
+        (
+            "quote_realtime",
+            QuoteRealtimeTool(provider),
+            {"symbols": ["700.HK"]},
+        ),
+        (
+            "quote_intraday",
+            QuoteIntradayTool(provider),
+            {"symbol": "700.HK"},
+        ),
+        (
+            "quote_candlesticks",
+            QuoteCandlesticksTool(provider),
+            {"symbol": "700.HK", "period": "Day", "count": 5},
+        ),
+        (
+            "quote_history_candlesticks",
+            QuoteHistoryCandlesticksTool(provider),
+            {
+                "symbol": "700.HK",
+                "period": "Day",
+                "query_mode": "offset",
+                "forward": False,
+                "count": 3,
+            },
+        ),
+        (
+            "quote_watchlist_groups",
+            QuoteWatchlistGroupsTool(provider),
+            {},
+        ),
+    ]
+
+    failed = 0
+    for name, tool, params in scenarios:
+        try:
+            raw = tool.run(params)
+            payload = json.loads(raw)
+            if payload.get("success"):
+                print(f"[通过] {name}")
+            else:
+                print(f"[失败] {name}: {payload.get('error')}")
+                failed += 1
+        except Exception as exc:
+            print(f"[失败] {name}: {exc}")
+            failed += 1
+
+    print()
+    if failed:
+        print(f"共 {failed} 项失败")
+        return 1
+    print("全部通过")
+    return 0
+
+
+def parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Trading Agent (LongPort)")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="运行 LongPort 行情工具集成烟测后退出",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     init_longport()
     
-    task_store = TaskStore()
-    exec_agent = ExecuteAgent(task_store)
-    plan_agent = PlanAgent(task_store)
-    plan_agent.register_tool(
-        ExecuteNextTaskTool(
-            task_store,
-            exec_agent,
-            session_id_provider=lambda: plan_agent.current_session_id,
-        )
-    )
-    plan_agent.chat("你好")
+    # task_store = TaskStore()
+    # exec_agent = ExecuteAgent(task_store)
+    # plan_agent = PlanAgent(task_store)
+    # plan_agent.register_tool(
+    #     ExecuteNextTaskTool(
+    #         task_store,
+    #         exec_agent,
+    #         session_id_provider=lambda: plan_agent.current_session_id,
+    #     )
+    # )
+    # plan_agent.chat("你好")
 
 if __name__ == "__main__":
+    cli_args = parse_cli_args()
+    if cli_args.test:
+        sys.exit(run_integration_tests())
     main()

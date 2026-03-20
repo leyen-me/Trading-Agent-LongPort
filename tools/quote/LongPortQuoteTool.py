@@ -1,9 +1,8 @@
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from longport.openapi import QuoteContext
 
 from ..BaseTool import BaseTool
-from utils import serialize_longport_value
 
 
 class LongPortQuoteTool(BaseTool):
@@ -17,6 +16,3 @@ class LongPortQuoteTool(BaseTool):
         if ctx is None:
             raise RuntimeError("quote_ctx 尚未初始化，请先执行 init_longport()")
         return ctx
-
-    def serialize(self, data: Any) -> Any:
-        return serialize_longport_value(data)

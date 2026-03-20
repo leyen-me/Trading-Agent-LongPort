@@ -17,6 +17,15 @@ from longport.openapi import TradeContext, QuoteContext, Config as LongPortConfi
 
 # self defined
 from config import Config
+from tools import (
+    BaseTool,
+    QuoteCandlesticksTool,
+    QuoteHistoryCandlesticksTool,
+    QuoteIntradayTool,
+    QuoteRealtimeTool,
+    QuoteStaticInfoTool,
+    QuoteWatchlistGroupsTool,
+)
 
 
 # ==== 日志配置 ====
@@ -240,6 +249,12 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <tool>sleep</tool>
     <tool>read_tasks</tool>
     <tool>update_task</tool>
+    <tool>quote_static_info</tool>
+    <tool>quote_realtime</tool>
+    <tool>quote_intraday</tool>
+    <tool>quote_candlesticks</tool>
+    <tool>quote_history_candlesticks</tool>
+    <tool>quote_watchlist_groups</tool>
   </available_tools>
 
   <completion_rules>
@@ -301,40 +316,6 @@ def with_runtime_context(
     """把运行时上下文插入到 system XML 中，保持单一 <system> 根节点。"""
     runtime_context_xml = build_runtime_context_xml(agent_name, model_name)
     return base_prompt.replace("</system>", f"{runtime_context_xml}\n</system>", 1)
-
-
-# ==== 工具基类 ====
-
-
-class BaseTool:
-    """所有工具的统一抽象基类。"""
-
-    name: str = ""
-    description: str = ""
-    parameters: Dict[str, Any] = {}
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        raise NotImplementedError
-
-    def success(self, data: Any) -> str:
-        return json.dumps(
-            {"success": True, "data": data, "error": None},
-            ensure_ascii=False,
-        )
-
-    def fail(self, msg: str) -> str:
-        return json.dumps(
-            {"success": False, "data": None, "error": msg},
-            ensure_ascii=False,
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters,
-        }
 
 
 @dataclass
@@ -1528,6 +1509,12 @@ class ExecuteAgent(BaseAgent):
             )
         )
         self.register_tool(TaskUpdateTool(task_store))
+        self.register_tool(QuoteStaticInfoTool(lambda: quote_ctx))
+        self.register_tool(QuoteRealtimeTool(lambda: quote_ctx))
+        self.register_tool(QuoteIntradayTool(lambda: quote_ctx))
+        self.register_tool(QuoteCandlesticksTool(lambda: quote_ctx))
+        self.register_tool(QuoteHistoryCandlesticksTool(lambda: quote_ctx))
+        self.register_tool(QuoteWatchlistGroupsTool(lambda: quote_ctx))
 
     def reset_conversation(self) -> None:
         """重置上下文与当前任务运行期状态。"""
@@ -1567,6 +1554,8 @@ class ExecuteNextTaskTool(BaseTool):
             return self.success(result)
         except Exception as e:
             return self.fail(str(e))
+
+
 
 
 

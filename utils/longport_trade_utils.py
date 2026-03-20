@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
 
 from longport.openapi import (
     Market,
     Order,
+    OrderChargeDetail,
+    OrderChargeFee,
+    OrderChargeItem,
+    OrderDetail,
+    OrderHistoryDetail,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -15,6 +20,18 @@ from longport.openapi import (
 )
 
 from .longport_quote_utils import parse_datetime, validate_symbol
+
+if TYPE_CHECKING:
+    # 以下类型仅在 openapi.pyi 中声明，运行时扩展模块不导出，供 Pyright/mypy 使用
+    from longport.openapi import (
+        AccountBalance,
+        StockPosition,
+        StockPositionChannel,
+        StockPositionsResponse,
+    )
+
+# 订单列表项：列表接口返回 Order；详情为 OrderDetail，字段兼容 pack_order
+OrderLike = Union[Order, OrderDetail]
 
 
 def _enum_suffix(name: str) -> str:
@@ -207,7 +224,7 @@ def validate_symbols_optional(value: Any) -> Optional[List[str]]:
     raise ValueError("symbols 应为字符串数组")
 
 
-def pack_order(o: Order) -> dict[str, Any]:
+def pack_order(o: OrderLike) -> dict[str, Any]:
     return {
         "order_id": o.order_id,
         "status": scalar_to_json(o.status),
@@ -238,7 +255,7 @@ def pack_order(o: Order) -> dict[str, Any]:
     }
 
 
-def pack_order_history_item(h: Any) -> dict[str, Any]:
+def pack_order_history_item(h: OrderHistoryDetail) -> dict[str, Any]:
     return {
         "price": scalar_to_json(h.price),
         "quantity": scalar_to_json(h.quantity),
@@ -248,7 +265,7 @@ def pack_order_history_item(h: Any) -> dict[str, Any]:
     }
 
 
-def pack_charge_fee(f: Any) -> dict[str, Any]:
+def pack_charge_fee(f: OrderChargeFee) -> dict[str, Any]:
     return {
         "code": f.code,
         "name": f.name,
@@ -257,7 +274,7 @@ def pack_charge_fee(f: Any) -> dict[str, Any]:
     }
 
 
-def pack_charge_item(item: Any) -> dict[str, Any]:
+def pack_charge_item(item: OrderChargeItem) -> dict[str, Any]:
     return {
         "code": scalar_to_json(item.code),
         "name": item.name,
@@ -265,7 +282,7 @@ def pack_charge_item(item: Any) -> dict[str, Any]:
     }
 
 
-def pack_charge_detail(d: Any) -> dict[str, Any]:
+def pack_charge_detail(d: OrderChargeDetail) -> dict[str, Any]:
     return {
         "total_amount": scalar_to_json(d.total_amount),
         "currency": d.currency,
@@ -273,7 +290,7 @@ def pack_charge_detail(d: Any) -> dict[str, Any]:
     }
 
 
-def pack_order_detail(d: Any) -> dict[str, Any]:
+def pack_order_detail(d: OrderDetail) -> dict[str, Any]:
     base = pack_order(d)
     base.update(
         {
@@ -293,41 +310,34 @@ def pack_order_detail(d: Any) -> dict[str, Any]:
     return base
 
 
-def pack_cash_info(c: Any) -> dict[str, Any]:
+def _available_cash_for_currency(b: AccountBalance, currency: str) -> Any:
+    """Pick available_cash from cash_infos for currency, else first row."""
+    for c in b.cash_infos:
+        if c.currency == currency:
+            return scalar_to_json(c.available_cash)
+    if b.cash_infos:
+        return scalar_to_json(b.cash_infos[0].available_cash)
+    return None
+
+
+def pack_account_balance(
+    b: AccountBalance,
+    *,
+    available_currency: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Three fields: net_assets, available cash (by currency), buy_power.
+    If available_currency matches the tool request, use it for available; else b.currency.
+    """
+    ccy = (available_currency or "").strip() or b.currency
     return {
-        "withdraw_cash": scalar_to_json(c.withdraw_cash),
-        "available_cash": scalar_to_json(c.available_cash),
-        "frozen_cash": scalar_to_json(c.frozen_cash),
-        "settling_cash": scalar_to_json(c.settling_cash),
-        "currency": c.currency,
-    }
-
-
-def pack_frozen_fee(f: Any) -> dict[str, Any]:
-    return {
-        "currency": f.currency,
-        "frozen_transaction_fee": scalar_to_json(f.frozen_transaction_fee),
-    }
-
-
-def pack_account_balance(b: Any) -> dict[str, Any]:
-    return {
-        "total_cash": scalar_to_json(b.total_cash),
-        "max_finance_amount": scalar_to_json(b.max_finance_amount),
-        "remaining_finance_amount": scalar_to_json(b.remaining_finance_amount),
-        "risk_level": b.risk_level,
-        "margin_call": scalar_to_json(b.margin_call),
-        "currency": b.currency,
-        "cash_infos": [pack_cash_info(x) for x in b.cash_infos],
         "net_assets": scalar_to_json(b.net_assets),
-        "init_margin": scalar_to_json(b.init_margin),
-        "maintenance_margin": scalar_to_json(b.maintenance_margin),
+        "available": _available_cash_for_currency(b, ccy),
         "buy_power": scalar_to_json(b.buy_power),
-        "frozen_transaction_fees": pack_frozen_fee(b.frozen_transaction_fees),
     }
 
 
-def pack_stock_position(p: Any) -> dict[str, Any]:
+def pack_stock_position(p: StockPosition) -> dict[str, Any]:
     return {
         "symbol": p.symbol,
         "symbol_name": p.symbol_name,
@@ -340,14 +350,14 @@ def pack_stock_position(p: Any) -> dict[str, Any]:
     }
 
 
-def pack_stock_channel(ch: Any) -> dict[str, Any]:
+def pack_stock_channel(ch: StockPositionChannel) -> dict[str, Any]:
     return {
         "account_channel": ch.account_channel,
         "positions": [pack_stock_position(x) for x in ch.positions],
     }
 
 
-def pack_stock_positions_response(resp: Any) -> dict[str, Any]:
+def pack_stock_positions_response(resp: StockPositionsResponse) -> dict[str, Any]:
     return {
         "channels": [pack_stock_channel(x) for x in resp.channels],
     }

@@ -1,3 +1,4 @@
+# standard library
 import json
 import logging
 import os
@@ -10,7 +11,12 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# third party
 from openai import OpenAI
+from longport.openapi import TradeContext, QuoteContext, Config as LongPortConfig
+
+# self defined
+from config import Config
 
 
 # ==== 日志配置 ====
@@ -18,27 +24,18 @@ from openai import OpenAI
 SCRIPT_DIR = Path(__file__).resolve().parent
 _AGENT_DIR = SCRIPT_DIR / ".agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-_CONFIG_FILE = _AGENT_DIR / "config.json"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"
 _TASK_FILE = _AGENT_DIR / "task.json"
-_DEFAULT_CONFIG = {
-    "OPENAI_API_KEY": None,
-    "OPENAI_BASE_URL": None,
-    "OPENAI_MODEL": None,
-    "WORKSPACE_DIR": None,
-    "OPENAI_ENABLE_THINKING": True,
-}
+
+# 全局变量
+trade_ctx: TradeContext = None
+quote_ctx: QuoteContext = None
 
 
 def _ensure_runtime_storage() -> None:
     """确保 .agent 目录及运行时文件存在。"""
     _AGENT_DIR.mkdir(parents=True, exist_ok=True)
-    if not _CONFIG_FILE.exists():
-        _CONFIG_FILE.write_text(
-            json.dumps(_DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
     if not _HISTORY_FILE.exists():
         _HISTORY_FILE.write_text('{"sessions": []}\n', encoding="utf-8")
     _LOG_FILE.touch(exist_ok=True)
@@ -48,59 +45,10 @@ def _ensure_runtime_storage() -> None:
 
 _ensure_runtime_storage()
 
-
-def _load_runtime_config() -> Dict[str, Any]:
-    """加载 .agent/config.json，格式无效时抛出异常。"""
-    try:
-        content = _CONFIG_FILE.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        raise ValueError(f"读取配置文件失败：{_CONFIG_FILE}") from exc
-
-    if not content:
-        return {}
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"配置文件 JSON 格式无效：{_CONFIG_FILE}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError(f"配置文件顶层必须是对象：{_CONFIG_FILE}")
-
-    return data
-
-
-RUNTIME_CONFIG = _load_runtime_config()
-
-
-def get_config_value(
-    key: str,
-    *,
-    default: Optional[str] = None,
-    required: bool = False,
-) -> str:
-    """优先从配置文件读取，其次回退到环境变量。"""
-    config_value = RUNTIME_CONFIG.get(key)
-    if config_value is not None:
-        value = str(config_value).strip()
-        if value:
-            return value
-
-    env_value = os.getenv(key)
-    if env_value is not None:
-        value = env_value.strip()
-        if value:
-            return value
-
-    if default is not None:
-        return default
-
-    if required:
-        raise ValueError(
-            f"缺少必填配置 {key}，请先在 {_CONFIG_FILE} 中设置，或提供同名环境变量。"
-        )
-
-    return ""
+OPENAI_API_KEY = Config.OPENAI_API_KEY
+OPENAI_BASE_URL = Config.OPENAI_BASE_URL
+OPENAI_MODEL = Config.OPENAI_MODEL
+OPENAI_ENABLE_THINKING = Config.OPENAI_ENABLE_THINKING
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,15 +62,6 @@ logger = logging.getLogger("Agent")
 
 
 # ==== 运行时配置 ====
-
-OPENAI_API_KEY = get_config_value("OPENAI_API_KEY", required=True)
-OPENAI_BASE_URL = get_config_value("OPENAI_BASE_URL", required=True)
-OPENAI_MODEL = get_config_value("OPENAI_MODEL", required=True)
-DEFAULT_WORKSPACE_DIR = Path.cwd().resolve()
-WORKSPACE_DIR = Path(
-    get_config_value("WORKSPACE_DIR", default=str(DEFAULT_WORKSPACE_DIR))
-).expanduser().resolve()
-WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 ENABLE_COLOR = os.getenv("NO_COLOR") is None and os.getenv("TERM") != "dumb"
 ANSI_RESET = "\033[0m"
@@ -186,13 +125,8 @@ def print_console_block(title: str, lines: List[str], color: str = INFO_COLOR) -
     print(border)
 
 
-DEFAULT_CONTEXT_WINDOW = 200000
-
-
-MODEL_CONTEXT_WINDOWS = {
-    "minimax-m2.5": 204800,
-    "minimax-m2.5-highspeed": 204800,
-}
+DEFAULT_CONTEXT_WINDOW = Config.DEFAULT_CONTEXT_WINDOW
+MODEL_CONTEXT_WINDOWS = Config.MODEL_CONTEXT_WINDOWS
 
 
 @dataclass
@@ -206,56 +140,11 @@ class UsageSnapshot:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
-def get_optional_int_config(*keys: str) -> Optional[int]:
-    """读取可选整数配置，优先配置文件，其次环境变量。"""
-    for key in keys:
-        config_value = RUNTIME_CONFIG.get(key)
-        raw_value = config_value if config_value is not None else os.getenv(key)
-        if raw_value in (None, ""):
-            continue
-        try:
-            value = int(str(raw_value).strip())
-        except (TypeError, ValueError):
-            logger.warning("整数配置无效：%s=%r", key, raw_value)
-            continue
-        if value > 0:
-            return value
-    return None
-
-
-def get_optional_bool_config(*keys: str) -> Optional[bool]:
-    """读取可选布尔配置，优先配置文件，其次环境变量。"""
-    truthy = {"1", "true", "yes", "on"}
-    falsy = {"0", "false", "no", "off"}
-
-    for key in keys:
-        config_value = RUNTIME_CONFIG.get(key)
-        raw_value = config_value if config_value is not None else os.getenv(key)
-        if raw_value in (None, ""):
-            continue
-        if isinstance(raw_value, bool):
-            return raw_value
-
-        normalized = str(raw_value).strip().lower()
-        if normalized in truthy:
-            return True
-        if normalized in falsy:
-            return False
-        logger.warning("布尔配置无效：%s=%r", key, raw_value)
-    return None
-
-
 def resolve_model_context_window(model_name: str) -> Optional[int]:
     """返回模型的上下文窗口大小，支持显式配置覆盖。"""
-    configured = get_optional_int_config("OPENAI_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW")
-    if configured is not None:
-        return configured
+    if Config.OPENAI_CONTEXT_WINDOW is not None:
+        return Config.OPENAI_CONTEXT_WINDOW
     return MODEL_CONTEXT_WINDOWS.get(model_name.strip().lower(), DEFAULT_CONTEXT_WINDOW)
-
-
-OPENAI_ENABLE_THINKING = get_optional_bool_config("OPENAI_ENABLE_THINKING")
-if OPENAI_ENABLE_THINKING is None:
-    OPENAI_ENABLE_THINKING = True
 
 
 def format_percent(numerator: int, denominator: Optional[int]) -> str:
@@ -396,12 +285,6 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
             f"    <model>{escape(model_name)}</model>",
             f"    <now_time>{escape(get_now_time_text())}</now_time>",
             f"    <script_dir>{escape(str(SCRIPT_DIR))}</script_dir>",
-            f"    <workspace_dir>{escape(str(WORKSPACE_DIR))}</workspace_dir>",
-            (
-                "    <default_workspace_dir>"
-                f"{escape(str(DEFAULT_WORKSPACE_DIR))}"
-                "</default_workspace_dir>"
-            ),
             f"    <task_file>{escape(str(_TASK_FILE))}</task_file>",
             f"    <log_file>{escape(str(_LOG_FILE))}</log_file>",
             "  </runtime_context>",
@@ -940,37 +823,6 @@ class PlanHistoryStore:
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         return json.loads(json.dumps(self._sessions, ensure_ascii=False))
-
-
-# ==== Sleep 工具（保留供轮询等待） ====
-
-
-class SleepTool(BaseTool):
-    """提供跨平台等待能力，避免依赖 shell 睡眠命令。"""
-
-    name = "sleep"
-    description = "Sleep for a few seconds"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "seconds": {"type": "number"},
-        },
-        "required": ["seconds"],
-    }
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        try:
-            seconds = float(parameters["seconds"])
-        except (TypeError, ValueError, KeyError):
-            return self.fail("seconds must be a number")
-
-        if seconds < 0:
-            return self.fail("seconds must be >= 0")
-        if seconds > 30:
-            return self.fail("seconds must be <= 30")
-
-        time.sleep(seconds)
-        return self.success({"slept_seconds": seconds})
 
 
 class BaseAgent:
@@ -1669,7 +1521,6 @@ class ExecuteAgent(BaseAgent):
         self.task_store = task_store
         self.active_session_id: Optional[str] = None
         self.active_task_id: Optional[str] = None
-        self.register_tool(SleepTool())
         self.register_tool(
             ReadTasksTool(
                 task_store,
@@ -1718,8 +1569,16 @@ class ExecuteNextTaskTool(BaseTool):
             return self.fail(str(e))
 
 
+
+def init_longport():
+    global trade_ctx, quote_ctx
+    trade_ctx = TradeContext(LongPortConfig.from_env())
+    quote_ctx = QuoteContext(LongPortConfig.from_env())
+
+
 def main() -> None:
-    """主入口：死循环，供后续接入交易逻辑。"""
+    init_longport()
+    
     task_store = TaskStore()
     exec_agent = ExecuteAgent(task_store)
     plan_agent = PlanAgent(task_store)
@@ -1730,13 +1589,7 @@ def main() -> None:
             session_id_provider=lambda: plan_agent.current_session_id,
         )
     )
-
-    logger.info("Trading Agent 已启动，等待接入交易逻辑")
-
-    while True:
-        # TODO: 接入交易逻辑（行情、决策、下单等）
-        time.sleep(1)
-
+    plan_agent.chat("你好")
 
 if __name__ == "__main__":
     main()

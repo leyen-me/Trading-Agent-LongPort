@@ -350,7 +350,6 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
     if daily_market_context:
         lines.extend(
             [
-                "    <daily_context_refresh_policy>以下盘前上下文仅在每日 09:00 初始化时刷新，盘中不自动更新。</daily_context_refresh_policy>",
                 f"    <daily_market_context>{escape(json.dumps(daily_market_context, ensure_ascii=False, separators=(',', ':')))}</daily_market_context>",
             ]
         )

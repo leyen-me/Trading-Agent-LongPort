@@ -67,6 +67,7 @@ _LOG_FILE = _AGENT_DIR / "agent.log"
 trade_ctx: TradeContext = None
 quote_ctx: QuoteContext = None
 trading_agent = None
+
 day_candlestick_count = 0
 
 
@@ -336,13 +337,8 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
     return "\n".join(
         [
             "  <runtime_context>",
-            f"    <agent_name>{escape(agent_name)}</agent_name>",
-            f"    <model>{escape(model_name)}</model>",
-            f"    <now_time>{escape(get_now_time_text())}</now_time>",
-            f"    <script_dir>{escape(str(SCRIPT_DIR))}</script_dir>",
-            f"    <history_file>{escape(str(_HISTORY_FILE))}</history_file>",
-            f"    <trading_philosophy_file>{escape(str(TRADING_PHILOSOPHY_FILE))}</trading_philosophy_file>",
-            f"    <log_file>{escape(str(_LOG_FILE))}</log_file>",
+            f"    <symbol>{escape(Config.TRADE_SYMBOL)}</symbol>",
+            f"    <cycle>{escape(Config.TRADE_CYCLE)}</cycle>",
             "  </runtime_context>",
         ]
     )

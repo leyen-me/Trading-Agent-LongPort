@@ -1,5 +1,4 @@
 # standard library
-import argparse
 import json
 import logging
 import os
@@ -8,16 +7,10 @@ import sys
 import time
 import unicodedata
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-
-# 在导入 config（会校验 OPENAI_API_KEY）之前：--test / --help 不依赖真实 OpenAI
-if __name__ == "__main__" and any(
-    flag in sys.argv for flag in ("--test", "--test-full", "--help", "-h")
-):
-    os.environ.setdefault("OPENAI_API_KEY", "__LONGPORT_CLI_PLACEHOLDER__")
+from typing import Any, Dict, List, Optional
 
 # third party
 from openai import OpenAI
@@ -41,8 +34,7 @@ from tools import (
     TradeTodayOrdersTool,
 )
 
-# PlanAgent 仅注册只读 LongPort 工具；ExecuteAgent = 只读 + 下列改单类
-_PLAN_READ_ONLY_TRADE_TOOL_CLASSES = (
+_READ_ONLY_TRADE_TOOL_CLASSES = (
     TradeAccountBalanceTool,
     TradeEstimateBuyLimitTool,
     TradeHistoryOrdersTool,
@@ -50,7 +42,7 @@ _PLAN_READ_ONLY_TRADE_TOOL_CLASSES = (
     TradeStockPositionsTool,
     TradeTodayOrdersTool,
 )
-_EXECUTE_MUTATING_TRADE_TOOL_CLASSES = (
+_MUTATING_TRADE_TOOL_CLASSES = (
     TradeCancelOrderTool,
     TradeReplaceOrderTool,
     TradeSubmitOrderTool,
@@ -65,7 +57,6 @@ _AGENT_DIR = SCRIPT_DIR / ".agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"
-_TASK_FILE = _AGENT_DIR / "task.json"
 
 # 全局变量
 trade_ctx: TradeContext = None
@@ -78,8 +69,6 @@ def _ensure_runtime_storage() -> None:
     if not _HISTORY_FILE.exists():
         _HISTORY_FILE.write_text('{"sessions": []}\n', encoding="utf-8")
     _LOG_FILE.touch(exist_ok=True)
-    if not _TASK_FILE.exists():
-        _TASK_FILE.write_text("[]\n", encoding="utf-8")
 
 
 _ensure_runtime_storage()
@@ -217,80 +206,23 @@ def get_system_name() -> str:
 
 # ==== Prompt 模板 ====
 
-PLAN_AGENT_SYSTEM_PROMPT = """
+TRADING_AGENT_SYSTEM_PROMPT = """
 <system>
   <role>
-    你是一个激进的美股波段交易员，你正在接受公司的考核，市场会不定时推送7x24小时不间断的消息和股票的行情数据。
-    在这里没有 user，你所接受到的 user 的信息，均是市场推送的消息和股票的行情数据。
-    你负责根据行情数据和消息，制定交易策略，并执行交易。
-
-    除了波段交易员，你同时担任任务规划 Agent（PlanAgent）。
-    你负责理解需求、拆分任务，并持续推动任务完成。
+    你是专注美股日内（或短周期）交易的量化助手：在同一轮对话里完成信息收集、决策与下单/改单/撤单。
+    市场会推送QQQ的5分钟K线行情；你收到的 user 内容可视为市场输入。
   </role>
 
   <primary_goal>
-    生成清晰、可执行的任务列表，并把需要落地的请求推进到完成。
+    基于实时与历史数据控制风险，在可执行的前提下完成交易相关操作，并如实汇报。
   </primary_goal>
 
   <hard_constraints>
-    <rule>你只能直接调用自己已注册的工具。</rule>
-    <rule>不要重复创建已存在的任务，不要反复规划同一件事。</rule>
-    <rule>你只能使用只读工具查询行情、资金、持仓与订单信息；不得下单、改单、撤单或提交条件/止损单。任何会改变交易状态的操作必须写入任务，由 ExecuteAgent 执行。</rule>
+    <rule>你只能调用已注册工具；不要虚构行情、成交或账户状态。</rule>
+    <rule>工具失败时不要假装成功；可重试、调整方案，或明确说明失败原因。</rule>
   </hard_constraints>
 
   <available_tools>
-    <tool>task_plan</tool>
-    <tool>execute_next_task</tool>
-    <tool>quote_realtime</tool>
-    <tool>quote_candlesticks</tool>
-    <tool>trade_account_balance</tool>
-    <tool>trade_estimate_buy_limit</tool>
-    <tool>trade_history_orders</tool>
-    <tool>trade_order_detail</tool>
-    <tool>trade_stock_positions</tool>
-    <tool>trade_today_orders</tool>
-  </available_tools>
-
-  <tool_call_policy>
-    <rule>当你确认要拆分任务时，只调用一次 task_plan。</rule>
-    <rule>如果当前会话里已经存在未完成的 request，不要再次调用 task_plan；应继续调用 execute_next_task 推进当前 request。</rule>
-    <rule>调用 task_plan 时必须提供 request_summary，用一句简洁中文概括本轮目标。</rule>
-    <rule>创建任务后，应转入执行和汇总，而不是重复规划。</rule>
-  </tool_call_policy>
-
-  <execution_handoff>
-    <rule>创建任务后调用 execute_next_task，把待办任务逐个交给 ExecuteAgent 执行。</rule>
-    <rule>当 execute_next_task 返回还有待办任务时，继续调用 execute_next_task；当没有待办任务时，再汇总最终结果。</rule>
-  </execution_handoff>
-
-  <output_contract>
-    <rule>未开始规划时，不要假装已经执行过任务。</rule>
-    <rule>任务仍在推进时，优先继续调用工具，而不是提前写大段总结。</rule>
-    <rule>只有当没有待办任务时，才做最终汇总。</rule>
-  </output_contract>
-</system>
-"""
-
-EXECUTE_AGENT_SYSTEM_PROMPT = """
-<system>
-  <role>
-    你是任务执行 Agent（ExecuteAgent）。
-    你负责消费单个任务、实际执行操作，并反馈最终结果。
-  </role>
-
-  <primary_goal>
-    在不猜测、不偷懒、不虚构结果的前提下，尽最大可能把当前任务真实完成，并正确回写任务状态。
-  </primary_goal>
-
-  <hard_constraints>
-    <rule>不要假装执行过未执行的操作。</rule>
-    <rule>如果工具返回失败，不要假装成功；应根据现状重试、换策略，或如实失败。</rule>
-    <rule>任务状态查询应使用 read_tasks 工具。</rule>
-  </hard_constraints>
-
-  <available_tools>
-    <tool>read_tasks</tool>
-    <tool>update_task</tool>
     <tool>quote_realtime</tool>
     <tool>quote_candlesticks</tool>
     <tool>trade_account_balance</tool>
@@ -305,14 +237,13 @@ EXECUTE_AGENT_SYSTEM_PROMPT = """
     <tool>trade_stop_order</tool>
   </available_tools>
 
-  <completion_rules>
-    <rule>当任务完成时，必须调用 update_task，并将 status 设为 "done"。</rule>
-    <rule>如果任务失败，必须调用 update_task，并将 status 设为 "failed"。</rule>
-    <rule>不要在未调用 update_task 的情况下就认为任务已经结束。</rule>
-  </completion_rules>
+  <tool_call_policy>
+    <rule>需要行情或账户信息时先调用相应查询工具，再决策；多步操作在同一轮对话内顺序完成。</rule>
+    <rule>未完成必要工具调用前避免冗长臆测性总结。</rule>
+  </tool_call_policy>
 
   <output_contract>
-    <rule>调用 update_task 后，提供简短清晰的执行结果。</rule>
+    <rule>在工具结果已覆盖关键事实后，给出简洁、可核对的结论。</rule>
   </output_contract>
 </system>
 """
@@ -378,7 +309,7 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
             f"    <model>{escape(model_name)}</model>",
             f"    <now_time>{escape(get_now_time_text())}</now_time>",
             f"    <script_dir>{escape(str(SCRIPT_DIR))}</script_dir>",
-            f"    <task_file>{escape(str(_TASK_FILE))}</task_file>",
+            f"    <history_file>{escape(str(_HISTORY_FILE))}</history_file>",
             f"    <log_file>{escape(str(_LOG_FILE))}</log_file>",
             "  </runtime_context>",
         ]
@@ -396,404 +327,8 @@ def with_runtime_context(
     return base_prompt.replace("</system>", f"{runtime_context_xml}\n</system>", 1)
 
 
-@dataclass
-class TaskRecord:
-    """单个任务的持久化记录。"""
-    id: str
-    description: str
-    request_id: Optional[str] = None
-    session_id: Optional[str] = None
-    status: str = "pending"
-    result: Optional[str] = None
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    def to_storage_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "description": self.description,
-            "status": self.status,
-            "result": self.result,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-    @classmethod
-    def from_dict(
-        cls,
-        data: Dict[str, Any],
-        *,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> "TaskRecord":
-        return cls(
-            id=data["id"],
-            description=data["description"],
-            request_id=data.get("request_id", request_id),
-            session_id=data.get("session_id", session_id),
-            status=data.get("status", "pending"),
-            result=data.get("result"),
-            created_at=data.get("created_at", time.time()),
-            updated_at=data.get("updated_at", time.time()),
-        )
-
-
-@dataclass
-class RequestRecord:
-    """单次用户请求的持久化记录。"""
-
-    id: str
-    session_id: Optional[str] = None
-    summary: str = ""
-    user_input: Optional[str] = None
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    tasks: List[TaskRecord] = field(default_factory=list)
-
-    def compute_status(self) -> str:
-        if not self.tasks:
-            return "pending"
-        if any(task.status == "running" for task in self.tasks):
-            return "running"
-        if any(task.status == "pending" for task in self.tasks):
-            return "pending"
-        if any(task.status == "failed" for task in self.tasks):
-            return "failed"
-        return "done"
-
-    def has_active_tasks(self) -> bool:
-        return any(task.status in {"pending", "running"} for task in self.tasks)
-
-    def to_storage_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "session_id": self.session_id,
-            "summary": self.summary,
-            "user_input": self.user_input,
-            "status": self.compute_status(),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "tasks": [
-                task.to_storage_dict()
-                for task in sorted(self.tasks, key=lambda item: item.created_at)
-            ],
-        }
-
-
-class TaskStore:
-    """负责加载、保存和管理请求与任务状态。"""
-
-    def __init__(self, storage_path: Path = _TASK_FILE) -> None:
-        self.storage_path = storage_path
-        self._requests: Dict[str, RequestRecord] = {}
-        self._tasks: Dict[str, TaskRecord] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if not self.storage_path.exists():
-            return
-
-        try:
-            content = self.storage_path.read_text(encoding="utf-8").strip()
-            raw = {"requests": []} if not content else json.loads(content)
-        except Exception:
-            logger.exception("加载 task.json 失败")
-            return
-
-        self._requests.clear()
-        self._tasks.clear()
-
-        if isinstance(raw, list):
-            self._load_legacy_tasks(raw)
-            return
-
-        requests = raw.get("requests") if isinstance(raw, dict) else None
-        if not isinstance(requests, list):
-            logger.warning("task.json 格式无效，已忽略")
-            return
-
-        for item in requests:
-            if not isinstance(item, dict):
-                continue
-            request_id = str(item.get("id", "")).strip() or str(uuid.uuid4())[:8]
-            request = RequestRecord(
-                id=request_id,
-                session_id=item.get("session_id"),
-                summary=str(item.get("summary", "")).strip(),
-                user_input=item.get("user_input"),
-                created_at=item.get("created_at", time.time()),
-                updated_at=item.get("updated_at", time.time()),
-            )
-            raw_tasks = item.get("tasks")
-            if not isinstance(raw_tasks, list):
-                raw_tasks = []
-            for raw_task in raw_tasks:
-                if not isinstance(raw_task, dict):
-                    continue
-                try:
-                    task = TaskRecord.from_dict(
-                        raw_task,
-                        request_id=request.id,
-                        session_id=request.session_id,
-                    )
-                except KeyError:
-                    continue
-                request.tasks.append(task)
-                self._tasks[task.id] = task
-            self._requests[request.id] = request
-
-    def _load_legacy_tasks(self, raw_tasks: List[Any]) -> None:
-        legacy_groups: Dict[Optional[str], List[TaskRecord]] = {}
-        for item in raw_tasks:
-            if not isinstance(item, dict):
-                continue
-            try:
-                task = TaskRecord.from_dict(item)
-            except KeyError:
-                continue
-            legacy_groups.setdefault(task.session_id, []).append(task)
-
-        for session_id, tasks in legacy_groups.items():
-            if not tasks:
-                continue
-            tasks.sort(key=lambda item: item.created_at)
-            now = time.time()
-            request = RequestRecord(
-                id=f"legacy-{tasks[0].id}",
-                session_id=session_id,
-                summary="历史任务迁移（缺少原始请求摘要）",
-                created_at=min((task.created_at for task in tasks), default=now),
-                updated_at=max((task.updated_at for task in tasks), default=now),
-            )
-            for task in tasks:
-                task.request_id = request.id
-                request.tasks.append(task)
-                self._tasks[task.id] = task
-            self._requests[request.id] = request
-
-    def _save(self) -> None:
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "requests": [
-                request.to_storage_dict()
-                for request in sorted(
-                    self._requests.values(), key=lambda item: item.created_at
-                )
-            ]
-        }
-        temp_path = self.storage_path.with_suffix(".json.tmp")
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp_path.replace(self.storage_path)
-
-    def reset(self) -> None:
-        self._requests.clear()
-        self._tasks.clear()
-        self._save()
-
-    def _iter_tasks(
-        self,
-        session_id: Optional[str] = None,
-        request_id: Optional[str] = None,
-    ) -> List[TaskRecord]:
-        tasks = sorted(self._tasks.values(), key=lambda task: task.created_at)
-        if request_id is not None:
-            tasks = [task for task in tasks if task.request_id == request_id]
-        if session_id is None:
-            return tasks
-        return [task for task in tasks if task.session_id == session_id]
-
-    def _iter_requests(self, session_id: Optional[str] = None) -> List[RequestRecord]:
-        requests = sorted(self._requests.values(), key=lambda item: item.created_at)
-        if session_id is None:
-            return requests
-        return [request for request in requests if request.session_id == session_id]
-
-    def _find_reusable_request(
-        self,
-        session_id: Optional[str],
-        request_summary: str,
-        user_input: Optional[str],
-    ) -> Optional[RequestRecord]:
-        for request in reversed(self._iter_requests(session_id)):
-            if request.summary != request_summary:
-                continue
-            if (request.user_input or None) != (user_input or None):
-                continue
-            if request.has_active_tasks():
-                return request
-        return None
-
-    def _build_task_dict(self, task: TaskRecord) -> Dict[str, Any]:
-        data = task.to_dict()
-        request = self._requests.get(task.request_id or "")
-        data["request_summary"] = request.summary if request else ""
-        data["user_input"] = request.user_input if request else None
-        return data
-
-    def get_task_dict(self, task_id: str) -> Optional[Dict[str, Any]]:
-        task = self.get(task_id)
-        if task is None:
-            return None
-        return self._build_task_dict(task)
-
-    def _build_request_dict(self, request: RequestRecord) -> Dict[str, Any]:
-        return {
-            "id": request.id,
-            "session_id": request.session_id,
-            "summary": request.summary,
-            "user_input": request.user_input,
-            "status": request.compute_status(),
-            "created_at": request.created_at,
-            "updated_at": request.updated_at,
-            "tasks": [self._build_task_dict(task) for task in self._iter_tasks(request_id=request.id)],
-        }
-
-    def get_active_request(self, session_id: Optional[str] = None) -> Optional[RequestRecord]:
-        for request in self._iter_requests(session_id):
-            if request.has_active_tasks():
-                return request
-        return None
-
-    def has_active_request(self, session_id: Optional[str] = None) -> bool:
-        return self.get_active_request(session_id) is not None
-
-    def create_tasks(
-        self,
-        raw_tasks: List[Any],
-        session_id: Optional[str] = None,
-        request_summary: str = "",
-        user_input: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        created: List[Dict[str, Any]] = []
-        normalized_summary = str(request_summary).strip()
-        normalized_user_input = str(user_input).strip() if user_input is not None else None
-        request = self._find_reusable_request(
-            session_id,
-            normalized_summary,
-            normalized_user_input,
-        )
-        created_request = False
-        if request is None:
-            now = time.time()
-            request = RequestRecord(
-                id=str(uuid.uuid4())[:8],
-                session_id=session_id,
-                summary=normalized_summary,
-                user_input=normalized_user_input,
-                created_at=now,
-                updated_at=now,
-            )
-            self._requests[request.id] = request
-            created_request = True
-
-        for raw_task in raw_tasks:
-            if isinstance(raw_task, dict):
-                description = str(raw_task.get("description", "")).strip()
-            else:
-                description = str(raw_task).strip()
-
-            if not description:
-                continue
-
-            if any(
-                task.description == description for task in request.tasks
-            ):
-                continue
-
-            task = TaskRecord(
-                id=str(uuid.uuid4())[:8],
-                description=description,
-                request_id=request.id,
-                session_id=session_id,
-            )
-            self._tasks[task.id] = task
-            request.tasks.append(task)
-            request.updated_at = time.time()
-            created.append(self._build_task_dict(task))
-
-        if created_request and not request.tasks:
-            self._requests.pop(request.id, None)
-        self._save()
-        return created
-
-    def list_tasks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        return [self._build_task_dict(task) for task in self._iter_tasks(session_id)]
-
-    def list_requests(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        return [self._build_request_dict(request) for request in self._iter_requests(session_id)]
-
-    def get(self, task_id: str) -> Optional[TaskRecord]:
-        return self._tasks.get(task_id)
-
-    def get_request(self, request_id: str) -> Optional[RequestRecord]:
-        return self._requests.get(request_id)
-
-    def get_next_pending(self, session_id: Optional[str] = None) -> Optional[TaskRecord]:
-        active_request = self.get_active_request(session_id)
-        if active_request is None:
-            return None
-        for task in self._iter_tasks(session_id, request_id=active_request.id):
-            if task.status == "pending":
-                return task
-        return None
-
-    def pending_tasks(
-        self,
-        session_id: Optional[str] = None,
-        request_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        return [
-            self._build_task_dict(task)
-            for task in self._iter_tasks(session_id, request_id=request_id)
-            if task.status == "pending"
-        ]
-
-    def completed_tasks(
-        self,
-        session_id: Optional[str] = None,
-        request_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        return [
-            self._build_task_dict(task)
-            for task in self._iter_tasks(session_id, request_id=request_id)
-            if task.status in {"done", "failed"}
-        ]
-
-    def has_active_tasks(self, session_id: Optional[str] = None) -> bool:
-        return any(
-            task.status in {"pending", "running"}
-            for task in self._iter_tasks(session_id)
-        )
-
-    def update_task(
-        self, task_id: str, status: str, result: Optional[str] = None
-    ) -> Dict[str, Any]:
-        if status not in TASK_STATUS:
-            raise ValueError("invalid status")
-
-        task = self.get(task_id)
-        if not task:
-            raise KeyError("task not found")
-
-        task.status = status
-        if result is not None:
-            task.result = result
-        task.updated_at = time.time()
-        request = self.get_request(task.request_id or "")
-        if request is not None:
-            request.updated_at = task.updated_at
-        self._save()
-        return self._build_task_dict(task)
-
-
 class PlanHistoryStore:
-    """负责持久化 PlanAgent 的上下文历史。"""
+    """负责持久化交易 Agent 的上下文历史。"""
 
     def __init__(self, storage_path: Path = _HISTORY_FILE) -> None:
         self.storage_path = storage_path
@@ -933,7 +468,7 @@ class BaseAgent:
         """生成 usage 报告文本。"""
         usage = self.get_usage_snapshot()
         if usage is None:
-            return ["当前还没有 usage 数据，请先让 PlanAgent 完成至少一次对话。"]
+            return ["当前还没有 usage 数据，请先完成至少一次对话。"]
 
         context_limit = self.get_context_window()
         context_percent = format_percent(usage.prompt_tokens, context_limit)
@@ -1078,7 +613,7 @@ class BaseAgent:
         stop_after_tool_names: Optional[List[str]] = None,
     ) -> str:
         """
-        silent: 为 True 时不向用户打印任何内容（用于 exec_agent 内部执行，反馈给 plan_agent）
+        silent: 为 True 时不向用户打印任何内容（用于内部/无界面调用）
         """
         if reset_history:
             self.reset_conversation()
@@ -1259,284 +794,47 @@ class BaseAgent:
             return ""
 
 
-# ==== Plan Agent ====
-
-TASK_STATUS = ["pending", "running", "done", "failed"]
+# ==== TradingAgent ====
 
 
-class TaskPlanTool(BaseTool):
-    """向任务存储写入规划后的任务列表。"""
-    def __init__(
-        self,
-        task_store: TaskStore,
-        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
-        request_input_provider: Optional[Callable[[], Optional[str]]] = None,
-    ):
-        self.task_store = task_store
-        self.session_id_provider = session_id_provider
-        self.request_input_provider = request_input_provider
-
-    name = "task_plan"
-    description = "Create tasks"
-
-    parameters = {
-        "type": "object",
-        "properties": {
-            "request_summary": {"type": "string"},
-            "tasks": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"description": {"type": "string"}},
-                    "required": ["description"],
-                },
-            }
-        },
-        "required": ["request_summary", "tasks"],
-    }
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        session_id = (
-            self.session_id_provider() if callable(self.session_id_provider) else None
-        )
-        user_input = (
-            self.request_input_provider() if callable(self.request_input_provider) else None
-        )
-        active_request = self.task_store.get_active_request(session_id)
-        if active_request is not None:
-            return self.fail(
-                "active request exists; continue executing current request before creating a new task plan"
-            )
-        created = self.task_store.create_tasks(
-            parameters["tasks"],
-            session_id=session_id,
-            request_summary=str(parameters.get("request_summary", "")).strip(),
-            user_input=user_input,
-        )
-        return self.success(created)
-
-
-class TaskUpdateTool(BaseTool):
-    """更新任务执行状态和结果。"""
-    def __init__(
-        self,
-        task_store: TaskStore,
-        result_enricher: Optional[Callable[[str, str, Optional[str]], Optional[str]]] = None,
-    ):
-        self.task_store = task_store
-        self.result_enricher = result_enricher
-
-    name = "update_task"
-
-    parameters = {
-        "type": "object",
-        "properties": {
-            "task_id": {"type": "string"},
-            "status": {
-                "type": "string",
-                "enum": ["pending", "running", "done", "failed"],
-            },
-            "result": {"type": "string"},
-        },
-        "required": ["task_id", "status"],
-    }
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-
-        try:
-            result = parameters.get("result")
-            if callable(self.result_enricher):
-                result = self.result_enricher(
-                    parameters["task_id"],
-                    parameters["status"],
-                    result,
-                )
-            updated = self.task_store.update_task(
-                task_id=parameters["task_id"],
-                status=parameters["status"],
-                result=result,
-            )
-            return self.success(updated)
-        except KeyError:
-            return self.fail("task not found")
-        except ValueError:
-            return self.fail("invalid status")
-
-
-class ReadTasksTool(BaseTool):
-    """按当前会话读取任务信息。"""
+class TradingAgent(BaseAgent):
+    """日内交易：在同一对话内完成查询与下单。"""
 
     def __init__(
         self,
-        task_store: TaskStore,
-        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
-    ):
-        self.task_store = task_store
-        self.session_id_provider = session_id_provider
-
-    name = "read_tasks"
-    description = "Read current session tasks"
-
-    parameters = {
-        "type": "object",
-        "properties": {
-            "task_id": {"type": "string"},
-        },
-    }
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        session_id = (
-            self.session_id_provider() if callable(self.session_id_provider) else None
-        )
-        task_id = parameters.get("task_id")
-
-        if task_id:
-            task = self.task_store.get(task_id)
-            if task is None or task.session_id != session_id:
-                return self.fail("task not found")
-            task_data = self.task_store.get_task_dict(task.id)
-            if task_data is None:
-                return self.fail("task not found")
-            return self.success(task_data)
-
-        return self.success(self.task_store.list_requests(session_id=session_id))
-
-
-def execute_single_task(
-    exec_agent: "ExecuteAgent",
-    task_store: TaskStore,
-    session_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """取出一个待执行任务，并交给 ExecuteAgent 处理。"""
-    task = task_store.get_next_pending(session_id=session_id)
-    if task is None:
-        return {"executed": False, "task": None}
-
-    task_store.update_task(task.id, "running")
-    print(color_text(f"\n[执行中] {task.description}", EXECUTE_COLOR))
-    request = task_store.get_request(task.request_id or "")
-    request_summary = request.summary.strip() if request and request.summary else "未记录"
-    request_user_input = request.user_input.strip() if request and request.user_input else ""
-
-    previous_task_lines: List[str] = []
-    for previous in task_store.completed_tasks(
-        session_id=session_id,
-        request_id=task.request_id,
-    ):
-        result = (previous.get("result") or "").strip()
-        if len(result) > 200:
-            result = result[:200] + "..."
-        previous_task_lines.append(
-            f"- [{previous['status']}] {previous['description']}"
-            + (f" | 结果：{result}" if result else "")
-        )
-
-    previous_task_summary = "\n".join(previous_task_lines) or "无"
-
-    task_prompt = (
-        f"任务ID：{task.id}\n"
-        f"请求ID：{task.request_id or '未记录'}\n"
-        f"用户目标摘要：{request_summary}\n"
-        + (f"用户原始输入：{request_user_input}\n" if request_user_input else "")
-        + f"任务描述：{task.description}\n\n"
-        + f"已完成任务摘要：\n{previous_task_summary}\n\n"
-        + "你正在延续同一个项目，请基于上述已完成任务继续执行。\n"
-        + "任务状态只以本任务输入和 update_task 工具为准。\n"
-        + "执行完成后请调用 update_task 更新最终状态。调用后不要继续长篇总结。"
-    )
-
-    exec_agent.active_session_id = session_id
-    exec_agent.active_task_id = task.id
-    try:
-        result = exec_agent.chat(
-            task_prompt,
-            silent=False,
-            reset_history=False,
-            stop_after_tool_names=["update_task"],
-        )
-    except Exception as e:
-        logger.exception("执行任务失败: %s", task.description)
-        result = f"执行异常：{e}"
-        task_store.update_task(task.id, "failed", result=result)
-    finally:
-        exec_agent.active_session_id = None
-        exec_agent.active_task_id = None
-
-    latest_task = task_store.get(task.id)
-    if latest_task and latest_task.status == "running":
-        task_store.update_task(task.id, "done", result=result)
-        latest_task = task_store.get(task.id)
-    elif latest_task and not latest_task.result:
-        task_store.update_task(task.id, latest_task.status, result=result)
-        latest_task = task_store.get(task.id)
-
-    if latest_task is None:
-        raise RuntimeError(f"task disappeared: {task.id}")
-
-    print(
-        color_text(
-            f"[任务结束] {latest_task.description} -> {latest_task.status}",
-            EXECUTE_COLOR,
-        )
-    )
-    latest_task_data = task_store.get_task_dict(task.id)
-    return {"executed": True, "task": latest_task_data}
-
-
-class PlanAgent(BaseAgent):
-    """负责理解需求、拆解任务并驱动执行流程。"""
-    """
-    1. 与用户直接交互的 PlanAgent， 用户不会直接与 ExecuteAgent 交互
-    2. 理解用户需求，使用只读工具查看行情、资金与持仓等。做出规划并生成任务列表。
-    3. 分配任务给 ExecuteAgent 执行。
-    4. ExecuteAgent 执行任务，直到子任务完成。并反馈任务进度。
-    5. 当子任务完成时，PlanAgent 主动汇报任务完成情况。
-    6. 当所有子任务完成时，PlanAgent 主动汇报任务完成情况。
-    """
-
-    def __init__(
-        self,
-        task_store: TaskStore,
         history_store: Optional[PlanHistoryStore] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
         system_prompt = system_prompt or with_runtime_context(
-            PLAN_AGENT_SYSTEM_PROMPT,
-            agent_name="PlanAgent",
+            TRADING_AGENT_SYSTEM_PROMPT,
+            agent_name="TradingAgent",
             model_name=model or OPENAI_MODEL,
         )
         super().__init__(
             model,
             system_prompt,
-            agent_name="PlanAgent",
-            temperature=0.3,
-            top_p=0.85,
+            agent_name="TradingAgent",
+            temperature=0.4,
+            top_p=0.88,
         )
         self.agent_color = PLAN_COLOR
-        self.task_store = task_store
         self.history_store = history_store or PlanHistoryStore()
-        self.current_user_request_input: Optional[str] = None
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
             self.messages,
-        )
-        self.register_tool(
-            TaskPlanTool(
-                task_store,
-                session_id_provider=lambda: self.current_session_id,
-                request_input_provider=lambda: self.current_user_request_input,
-            )
         )
         qp = lambda: quote_ctx
         tp = lambda: trade_ctx
         self.register_tool(QuoteRealtimeTool(qp))
         self.register_tool(QuoteCandlesticksTool(qp))
-        for tool_cls in _PLAN_READ_ONLY_TRADE_TOOL_CLASSES:
+        for tool_cls in _READ_ONLY_TRADE_TOOL_CLASSES:
+            self.register_tool(tool_cls(tp))
+        for tool_cls in _MUTATING_TRADE_TOOL_CLASSES:
             self.register_tool(tool_cls(tp))
 
     def reset_conversation(self) -> None:
-        """重置上下文，并为 PlanAgent 开启新的历史会话。"""
+        """重置上下文，并开启新的历史会话。"""
         if hasattr(self, "current_session_id"):
             self.history_store.archive_session(self.current_session_id, self.messages)
         super().reset_conversation()
@@ -1553,7 +851,6 @@ class PlanAgent(BaseAgent):
         reset_history: bool = False,
         stop_after_tool_names: Optional[List[str]] = None,
     ) -> str:
-        self.current_user_request_input = message
         try:
             return super().chat(
                 message,
@@ -1563,90 +860,6 @@ class PlanAgent(BaseAgent):
             )
         finally:
             self.history_store.sync_session(self.current_session_id, self.messages)
-            self.current_user_request_input = None
-
-# ==== Execute Agent ====
-
-
-class ExecuteAgent(BaseAgent):
-    """负责消费单个任务并落地执行。"""
-    def __init__(
-        self,
-        task_store: TaskStore,
-        model: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-    ):
-        system_prompt = system_prompt or with_runtime_context(
-            EXECUTE_AGENT_SYSTEM_PROMPT,
-            agent_name="ExecuteAgent",
-            model_name=model or OPENAI_MODEL,
-        )
-        super().__init__(
-            model,
-            system_prompt,
-            agent_name="ExecuteAgent",
-            temperature=0.6,
-            top_p=0.9,
-        )
-        self.agent_color = EXECUTE_COLOR
-        self.task_store = task_store
-        self.active_session_id: Optional[str] = None
-        self.active_task_id: Optional[str] = None
-        self.register_tool(
-            ReadTasksTool(
-                task_store,
-                session_id_provider=lambda: self.active_session_id,
-            )
-        )
-        self.register_tool(TaskUpdateTool(task_store))
-        qp = lambda: quote_ctx
-        tp = lambda: trade_ctx
-        self.register_tool(QuoteRealtimeTool(qp))
-        self.register_tool(QuoteCandlesticksTool(qp))
-        for tool_cls in _PLAN_READ_ONLY_TRADE_TOOL_CLASSES:
-            self.register_tool(tool_cls(tp))
-        for tool_cls in _EXECUTE_MUTATING_TRADE_TOOL_CLASSES:
-            self.register_tool(tool_cls(tp))
-
-    def reset_conversation(self) -> None:
-        """重置上下文与当前任务运行期状态。"""
-        super().reset_conversation()
-        self.active_task_id = None
-
-
-# ==== 任务分发工具 ====
-
-
-class ExecuteNextTaskTool(BaseTool):
-    """把下一个待办任务分发给 ExecuteAgent。"""
-    def __init__(
-        self,
-        task_store: TaskStore,
-        exec_agent: ExecuteAgent,
-        session_id_provider: Optional[Callable[[], Optional[str]]] = None,
-    ):
-        self.task_store = task_store
-        self.exec_agent = exec_agent
-        self.session_id_provider = session_id_provider
-
-    name = "execute_next_task"
-    description = "Dispatch next pending task to ExecuteAgent"
-    parameters = {"type": "object", "properties": {}}
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        try:
-            session_id = (
-                self.session_id_provider() if callable(self.session_id_provider) else None
-            )
-            result = execute_single_task(
-                self.exec_agent,
-                self.task_store,
-                session_id=session_id,
-            )
-            return self.success(result)
-        except Exception as e:
-            return self.fail(str(e))
-
 
 
 def init_longport():
@@ -1655,8 +868,8 @@ def init_longport():
     quote_ctx = QuoteContext(LongPortConfig.from_env())
 
 
-def _interactive_repl(plan_agent: PlanAgent) -> None:
-    """从标准输入循环读取用户消息并交给 PlanAgent。"""
+def _interactive_repl(agent: TradingAgent) -> None:
+    """从标准输入循环读取用户消息并交给 TradingAgent。"""
     print_console_block(
         "交互模式",
         [
@@ -1679,11 +892,11 @@ def _interactive_repl(plan_agent: PlanAgent) -> None:
         if lower in ("/quit", "/exit", "quit", "exit", "q"):
             break
         if lower == "/reset":
-            plan_agent.reset_conversation()
+            agent.reset_conversation()
             print(color_text("已重置会话上下文。", INFO_COLOR))
             continue
         try:
-            plan_agent.chat(text)
+            agent.chat(text)
         except KeyboardInterrupt:
             print(color_text("\n（已中断本轮，可继续输入）", INFO_COLOR))
             continue
@@ -1692,17 +905,8 @@ def _interactive_repl(plan_agent: PlanAgent) -> None:
 def main() -> None:
     init_longport()
 
-    task_store = TaskStore()
-    exec_agent = ExecuteAgent(task_store)
-    plan_agent = PlanAgent(task_store)
-    plan_agent.register_tool(
-        ExecuteNextTaskTool(
-            task_store,
-            exec_agent,
-            session_id_provider=lambda: plan_agent.current_session_id,
-        )
-    )
-    _interactive_repl(plan_agent)
+    agent = TradingAgent()
+    _interactive_repl(agent)
 
 
 if __name__ == "__main__":

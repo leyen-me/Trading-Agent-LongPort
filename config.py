@@ -67,3 +67,7 @@ class Config:
     DEFAULT_CONTEXT_WINDOW = int(os.getenv("DEFAULT_CONTEXT_WINDOW", "200000"))
     # 模型特定上下文窗口，格式：model1:size1,model2:size2
     MODEL_CONTEXT_WINDOWS = _parse_model_context_windows(os.getenv("MODEL_CONTEXT_WINDOW_OVERRIDES", "minimax-m2.5:204800,minimax-m2.5-highspeed:204800"))
+    # 交易标的
+    TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "QQQ")
+    # 交易周期
+    TRADE_CYCLE = os.getenv("TRADE_CYCLE", "min_5")

@@ -1,4 +1,5 @@
 # standard library
+from datetime import datetime
 import json
 import logging
 import os
@@ -14,10 +15,11 @@ from typing import Any, Dict, List, Optional
 
 # third party
 from openai import OpenAI
-from longport.openapi import TradeContext, QuoteContext, Config as LongPortConfig
+from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config as LongPortConfig, TradeSessions
 
 # self defined
 from config import Config
+from utils import parse_period
 from tools import (
     BaseTool,
     QuoteCandlesticksTool,
@@ -63,6 +65,7 @@ _LOG_FILE = _AGENT_DIR / "agent.log"
 # 全局变量
 trade_ctx: TradeContext = None
 quote_ctx: QuoteContext = None
+trading_agent = None
 
 
 def _ensure_runtime_storage() -> None:
@@ -910,51 +913,33 @@ class TradingAgent(BaseAgent):
             self.history_store.sync_session(self.current_session_id, self.messages)
 
 
-def init_longport():
-    global trade_ctx, quote_ctx
-    trade_ctx = TradeContext(LongPortConfig.from_env())
-    quote_ctx = QuoteContext(LongPortConfig.from_env())
+DAY_CANDLESTICK_COUNT = 0
 
+def on_candlestick(symbol: str, event: PushCandlestick):
 
-def _interactive_repl(agent: TradingAgent) -> None:
-    """从标准输入循环读取用户消息并交给 TradingAgent。"""
-    print_console_block(
-        "交互模式",
-        [
-            "输入你的问题后回车发送；空行忽略。",
-            "命令：/quit /exit 退出；/reset 清空本会话上下文。",
-            "EOF（Ctrl+D）也可结束。",
-        ],
-    )
-    prompt = color_text("你> ", PLAN_COLOR)
-    while True:
-        try:
-            line = input(prompt)
-        except EOFError:
-            print()
-            break
-        text = line.strip()
-        if not text:
-            continue
-        lower = text.lower()
-        if lower in ("/quit", "/exit", "quit", "exit", "q"):
-            break
-        if lower == "/reset":
-            agent.reset_conversation()
-            print(color_text("已重置会话上下文。", INFO_COLOR))
-            continue
-        try:
-            agent.chat(text)
-        except KeyboardInterrupt:
-            print(color_text("\n（已中断本轮，可继续输入）", INFO_COLOR))
-            continue
+    global DAY_CANDLESTICK_COUNT
+    if not event.is_confirmed:
+        return
 
+    DAY_CANDLESTICK_COUNT += 1
+
+    NEW_CANDLESTICK_TEXT = f"""
+    【时间】：{event.candlestick.timestamp.strftime("%Y-%m-%d %H:%M:%S")}，当前是今日的第{DAY_CANDLESTICK_COUNT}根K线。
+    【OHLC】：{event.candlestick.open} {event.candlestick.high} {event.candlestick.low} {event.candlestick.close}
+    【成交量】：{event.candlestick.volume}
+    """
+    MY_ORDER_TEXT = f"【当前订单信息】：{trade_ctx.today_orders()}"
+    MY_POSITION_TEXT = f"【当前持仓信息】：{trade_ctx.stock_positions()}"
+    trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + MY_ORDER_TEXT + "\n" + MY_POSITION_TEXT)
 
 def main() -> None:
-    init_longport()
+    global trade_ctx, quote_ctx, trading_agent
+    quote_ctx = QuoteContext(LongPortConfig.from_env())
+    trade_ctx = TradeContext(LongPortConfig.from_env())
+    trading_agent = TradingAgent()
 
-    agent = TradingAgent()
-    _interactive_repl(agent)
+    quote_ctx.set_on_candlestick(on_candlestick)
+    quote_ctx.subscribe_candlesticks(Config.TRADE_SYMBOL, parse_period(Config.TRADE_CYCLE), TradeSessions.Intraday)
 
 
 if __name__ == "__main__":

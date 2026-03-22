@@ -20,6 +20,7 @@ from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config
 # self defined
 from config import Config
 from utils import parse_period
+from utils.longport_trade_utils import pack_orders, pack_stock_positions_response
 from tools import (
     BaseTool,
     QuoteCandlesticksTool,
@@ -915,6 +916,62 @@ class TradingAgent(BaseAgent):
 
 DAY_CANDLESTICK_COUNT = 0
 
+def _build_trade_snapshot_text(symbol: str) -> str:
+    """将订单/持仓压缩成适合 prompt 的 JSON 摘要。"""
+    snapshot: Dict[str, Any] = {"symbol": symbol}
+
+    try:
+        orders = pack_orders(trade_ctx.today_orders(symbol=symbol))
+        snapshot["orders"] = {
+            "count": len(orders),
+            "items": [
+                {
+                    "order_id": order["order_id"],
+                    "status": order["status"],
+                    "side": order["side"],
+                    "quantity": order["quantity"],
+                    "executed_quantity": order["executed_quantity"],
+                    "price": order["price"],
+                    "symbol": order["symbol"],
+                }
+                for order in orders[-5:]
+            ],
+        }
+    except Exception as exc:
+        snapshot["orders"] = {"error": str(exc)}
+
+    # 30 秒内累计不超过 30 次调用，且每两次调用之间间隔不小于 0.02 秒
+    time.sleep(0.03)
+
+    try:
+        positions_resp = pack_stock_positions_response(
+            trade_ctx.stock_positions(symbols=[symbol])
+        )
+        positions = [
+            position
+            for channel in positions_resp.get("channels", [])
+            for position in channel.get("positions", [])
+        ]
+        snapshot["positions"] = {
+            "count": len(positions),
+            "items": [
+                {
+                    "symbol": position["symbol"],
+                    "symbol_name": position["symbol_name"],
+                    "quantity": position["quantity"],
+                    "available_quantity": position["available_quantity"],
+                    "cost_price": position["cost_price"],
+                    "currency": position["currency"],
+                }
+                for position in positions
+            ],
+        }
+    except Exception as exc:
+        snapshot["positions"] = {"error": str(exc)}
+
+    return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+
+
 def on_candlestick(symbol: str, event: PushCandlestick):
 
     global DAY_CANDLESTICK_COUNT
@@ -928,9 +985,8 @@ def on_candlestick(symbol: str, event: PushCandlestick):
     【OHLC】：{event.candlestick.open} {event.candlestick.high} {event.candlestick.low} {event.candlestick.close}
     【成交量】：{event.candlestick.volume}
     """
-    MY_ORDER_TEXT = f"【当前订单信息】：{trade_ctx.today_orders()}"
-    MY_POSITION_TEXT = f"【当前持仓信息】：{trade_ctx.stock_positions()}"
-    trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + MY_ORDER_TEXT + "\n" + MY_POSITION_TEXT)
+    TRADE_SNAPSHOT_TEXT = f"【当前交易状态摘要】：{_build_trade_snapshot_text(symbol)}"
+    trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + TRADE_SNAPSHOT_TEXT)
 
 def main() -> None:
     global trade_ctx, quote_ctx, trading_agent

@@ -1,4 +1,5 @@
 from .BaseTool import BaseTool
+from .TradingPhilosophyTool import TradingPhilosophyTool
 from .quote import (
     LongPortQuoteTool,
     QuoteCandlesticksTool,
@@ -20,6 +21,7 @@ from .trade import (
 
 __all__ = [
     "BaseTool",
+    "TradingPhilosophyTool",
     "LongPortQuoteTool",
     "LongPortTradeTool",
     "QuoteCandlesticksTool",

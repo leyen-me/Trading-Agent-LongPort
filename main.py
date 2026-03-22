@@ -22,6 +22,7 @@ from tools import (
     BaseTool,
     QuoteCandlesticksTool,
     QuoteRealtimeTool,
+    TradingPhilosophyTool,
     TradeAccountBalanceTool,
     TradeCancelOrderTool,
     TradeEstimateBuyLimitTool,
@@ -53,6 +54,7 @@ _MUTATING_TRADE_TOOL_CLASSES = (
 # ==== 日志配置 ====
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+TRADING_PHILOSOPHY_FILE = SCRIPT_DIR / "trading_philosophy.md"
 _AGENT_DIR = SCRIPT_DIR / ".agent"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
@@ -206,16 +208,37 @@ def get_system_name() -> str:
 
 # ==== Prompt 模板 ====
 
-TRADING_AGENT_SYSTEM_PROMPT = """
+
+def load_trading_philosophy_text() -> str:
+    """从 trading_philosophy.md 加载交易思想正文。"""
+    try:
+        return TRADING_PHILOSOPHY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.warning("未找到或无法读取交易思想文件: %s", TRADING_PHILOSOPHY_FILE)
+        return ""
+
+
+def build_trading_agent_system_prompt() -> str:
+    """组装系统提示：固定骨架 + 动态注入 trading_philosophy.md。"""
+    philosophy = load_trading_philosophy_text()
+    philosophy_xml = (
+        escape(philosophy)
+        if philosophy
+        else "（未加载 trading_philosophy.md，请将该文件放在脚本同目录）"
+    )
+    return f"""
 <system>
   <role>
-    你是专注美股日内（或短周期）交易的量化助手：在同一轮对话里完成信息收集、决策与下单/改单/撤单。
-    市场会推送QQQ的5分钟K线行情；你收到的 user 内容可视为市场输入。
+    你是专注美股日内交易员。
   </role>
 
   <primary_goal>
     基于实时与历史数据控制风险，在可执行的前提下完成交易相关操作，并如实汇报。
   </primary_goal>
+
+  <trading_philosophy>
+{philosophy_xml}
+  </trading_philosophy>
 
   <hard_constraints>
     <rule>你只能调用已注册工具；不要虚构行情、成交或账户状态。</rule>
@@ -223,6 +246,7 @@ TRADING_AGENT_SYSTEM_PROMPT = """
   </hard_constraints>
 
   <available_tools>
+    <tool>trading_philosophy</tool>
     <tool>quote_realtime</tool>
     <tool>quote_candlesticks</tool>
     <tool>trade_account_balance</tool>
@@ -240,13 +264,14 @@ TRADING_AGENT_SYSTEM_PROMPT = """
   <tool_call_policy>
     <rule>需要行情或账户信息时先调用相应查询工具，再决策；多步操作在同一轮对话内顺序完成。</rule>
     <rule>未完成必要工具调用前避免冗长臆测性总结。</rule>
+    <rule>盘后复盘或修订交易思想时，请使用 trading_philosophy 更新交易思想文件。</rule>
   </tool_call_policy>
 
   <output_contract>
     <rule>在工具结果已覆盖关键事实后，给出简洁、可核对的结论。</rule>
   </output_contract>
 </system>
-"""
+""".strip()
 
 
 def get_now_time_text() -> str:
@@ -310,6 +335,7 @@ def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
             f"    <now_time>{escape(get_now_time_text())}</now_time>",
             f"    <script_dir>{escape(str(SCRIPT_DIR))}</script_dir>",
             f"    <history_file>{escape(str(_HISTORY_FILE))}</history_file>",
+            f"    <trading_philosophy_file>{escape(str(TRADING_PHILOSOPHY_FILE))}</trading_philosophy_file>",
             f"    <log_file>{escape(str(_LOG_FILE))}</log_file>",
             "  </runtime_context>",
         ]
@@ -807,7 +833,7 @@ class TradingAgent(BaseAgent):
         system_prompt: Optional[str] = None,
     ):
         system_prompt = system_prompt or with_runtime_context(
-            TRADING_AGENT_SYSTEM_PROMPT,
+            build_trading_agent_system_prompt(),
             agent_name="TradingAgent",
             model_name=model or OPENAI_MODEL,
         )
@@ -826,6 +852,7 @@ class TradingAgent(BaseAgent):
         )
         qp = lambda: quote_ctx
         tp = lambda: trade_ctx
+        self.register_tool(TradingPhilosophyTool(TRADING_PHILOSOPHY_FILE))
         self.register_tool(QuoteRealtimeTool(qp))
         self.register_tool(QuoteCandlesticksTool(qp))
         for tool_cls in _READ_ONLY_TRADE_TOOL_CLASSES:
@@ -833,10 +860,25 @@ class TradingAgent(BaseAgent):
         for tool_cls in _MUTATING_TRADE_TOOL_CLASSES:
             self.register_tool(tool_cls(tp))
 
+    def _reload_system_prompt_from_disk(self) -> None:
+        """从磁盘重建 system（含最新 trading_philosophy.md 与运行时上下文）。
+
+        若当前 messages 首条为 system，则原地替换，以保留后续对话历史。
+        """
+        self.system_prompt = with_runtime_context(
+            build_trading_agent_system_prompt(),
+            agent_name=self.agent_name,
+            model_name=self.model,
+        )
+        self.base_messages = [{"role": "system", "content": self.system_prompt}]
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = {"role": "system", "content": self.system_prompt}
+
     def reset_conversation(self) -> None:
-        """重置上下文，并开启新的历史会话。"""
+        """重置上下文，并开启新的历史会话；并从磁盘重载 system。"""
         if hasattr(self, "current_session_id"):
             self.history_store.archive_session(self.current_session_id, self.messages)
+        self._reload_system_prompt_from_disk()
         super().reset_conversation()
         self.current_session_id = self.history_store.start_session(
             self.agent_name,
@@ -850,7 +892,13 @@ class TradingAgent(BaseAgent):
         silent: bool = False,
         reset_history: bool = False,
         stop_after_tool_names: Optional[List[str]] = None,
+        reload_system_prompt: bool = True,
     ) -> str:
+        """无人值守场景下默认每次调用前刷新 system；若需省 IO 可设 reload_system_prompt=False。
+
+        reset_history=True 时由 reset_conversation() 内重载，此处不再重复。"""
+        if reload_system_prompt and not reset_history:
+            self._reload_system_prompt_from_disk()
         try:
             return super().chat(
                 message,

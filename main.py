@@ -74,10 +74,16 @@ daily_market_context: Dict[str, Any] = {}
 last_daily_reset_date: Optional[str] = None
 last_daily_context_refresh_date: Optional[str] = None
 _daily_init_lock = threading.Lock()
+_agent_operation_lock = threading.Lock()
+post_close_review_timer: Optional[threading.Timer] = None
+last_candlestick_monotonic: Optional[float] = None
+last_candlestick_trade_date: Optional[str] = None
+last_post_close_review_trade_date: Optional[str] = None
 
 PREMARKET_INIT_HOUR = 9
 PREMARKET_INIT_MINUTE = 0
 DAILY_CONTEXT_4H_COUNT = 8
+POST_CLOSE_IDLE_SECONDS = 60 * 60
 
 
 
@@ -432,6 +438,7 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
             day_candlestick_count = 0
             daily_market_context = {}
             last_daily_reset_date = today
+            _cancel_post_close_review_timer()
             did_reset = True
 
         if needs_context_refresh:
@@ -445,9 +452,11 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
                 logger.warning("盘前上下文刷新失败，稍后会继续重试: %s", snapshot)
 
         if did_reset:
-            trading_agent.reset_conversation()
+            with _agent_operation_lock:
+                trading_agent.reset_conversation()
         elif did_refresh_context:
-            trading_agent._reload_system_prompt_from_disk()
+            with _agent_operation_lock:
+                trading_agent._reload_system_prompt_from_disk()
 
     if did_reset:
         lines = [
@@ -475,6 +484,79 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
         return True
 
     return False
+
+
+def _cancel_post_close_review_timer() -> None:
+    """取消已有的收盘复盘定时器。"""
+    global post_close_review_timer
+    if post_close_review_timer is not None:
+        post_close_review_timer.cancel()
+        post_close_review_timer = None
+
+
+def _build_post_close_review_prompt(trade_date_text: str) -> str:
+    """构造收盘后自动复盘提示。"""
+    return f"""
+检测到 {trade_date_text} 交易日已经连续 {POST_CLOSE_IDLE_SECONDS // 60} 分钟未收到新的确认K线，可视为已收盘。
+
+请执行一次简洁、事实优先的收盘复盘：
+1. 判断今天更接近趋势日、区间日还是过渡日。
+2. 总结 5 分钟结构演化、关键价位与 4 小时语境的关系。
+3. 查询并总结今日订单、成交/撤单/拒单等执行结果。
+4. 评估今天的执行是否符合 trading_philosophy。
+5. 给出下一个交易日最值得关注的观察点。
+
+只有在确有必要修订交易思想时，才调用 trading_philosophy 工具覆盖写入完整文件；否则不要改文件。
+""".strip()
+
+
+def _run_post_close_review_if_idle(expected_trade_date: str) -> None:
+    """若指定交易日 1 小时未再收到新 K 线，则触发复盘。"""
+    global post_close_review_timer, last_post_close_review_trade_date
+
+    with _daily_init_lock:
+        post_close_review_timer = None
+        if last_candlestick_trade_date != expected_trade_date:
+            return
+        if last_post_close_review_trade_date == expected_trade_date:
+            return
+        last_seen_at = last_candlestick_monotonic
+
+    if last_seen_at is None:
+        return
+    if time.monotonic() - last_seen_at < POST_CLOSE_IDLE_SECONDS:
+        return
+
+    with _agent_operation_lock:
+        if last_post_close_review_trade_date == expected_trade_date:
+            return
+        print_console_block(
+            "Post Close Review",
+            [
+                f"交易日: {expected_trade_date}",
+                f"已连续 {POST_CLOSE_IDLE_SECONDS // 60} 分钟未收到新的确认K线，开始自动复盘。",
+            ],
+            color=PLAN_COLOR,
+        )
+        trading_agent.chat(_build_post_close_review_prompt(expected_trade_date))
+        last_post_close_review_trade_date = expected_trade_date
+
+
+def _refresh_post_close_review_timer(trade_date_text: str) -> None:
+    """收到新 K 线后重置收盘复盘定时器。"""
+    global post_close_review_timer, last_candlestick_monotonic, last_candlestick_trade_date
+
+    with _daily_init_lock:
+        last_candlestick_monotonic = time.monotonic()
+        last_candlestick_trade_date = trade_date_text
+        _cancel_post_close_review_timer()
+        post_close_review_timer = threading.Timer(
+            POST_CLOSE_IDLE_SECONDS,
+            _run_post_close_review_if_idle,
+            args=(trade_date_text,),
+        )
+        post_close_review_timer.daemon = True
+        post_close_review_timer.start()
 
 
 def with_runtime_context(
@@ -1082,6 +1164,8 @@ def on_candlestick(symbol: str, event: PushCandlestick):
         return
 
     initialize_trading_day_if_needed()
+    trade_date_text = event.candlestick.timestamp.strftime("%Y-%m-%d")
+    _refresh_post_close_review_timer(trade_date_text)
     day_candlestick_count += 1
 
     NEW_CANDLESTICK_TEXT = f"""
@@ -1090,7 +1174,8 @@ def on_candlestick(symbol: str, event: PushCandlestick):
     【成交量】：{event.candlestick.volume}
     """
     TRADE_SNAPSHOT_TEXT = f"【当前交易状态摘要】：{_build_trade_snapshot_text(symbol)}"
-    trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + TRADE_SNAPSHOT_TEXT)
+    with _agent_operation_lock:
+        trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + TRADE_SNAPSHOT_TEXT)
 
 def main() -> None:
     global trade_ctx, quote_ctx, trading_agent
@@ -1105,3 +1190,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    while True:
+        time.sleep(1)

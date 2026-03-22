@@ -67,6 +67,8 @@ _LOG_FILE = _AGENT_DIR / "agent.log"
 trade_ctx: TradeContext = None
 quote_ctx: QuoteContext = None
 trading_agent = None
+day_candlestick_count = 0
+
 
 
 def _ensure_runtime_storage() -> None:
@@ -914,14 +916,13 @@ class TradingAgent(BaseAgent):
             self.history_store.sync_session(self.current_session_id, self.messages)
 
 
-DAY_CANDLESTICK_COUNT = 0
 
-def _build_trade_snapshot_text(symbol: str) -> str:
-    """将订单/持仓压缩成适合 prompt 的 JSON 摘要。"""
-    snapshot: Dict[str, Any] = {"symbol": symbol}
+def _build_trade_snapshot_text(trigger_symbol: str) -> str:
+    """将账户交易状态压缩成适合 prompt 的 JSON 摘要。"""
+    snapshot: Dict[str, Any] = {"trigger_symbol": trigger_symbol}
 
     try:
-        orders = pack_orders(trade_ctx.today_orders(symbol=symbol))
+        orders = pack_orders(trade_ctx.today_orders())
         snapshot["orders"] = {
             "count": len(orders),
             "items": [
@@ -944,15 +945,13 @@ def _build_trade_snapshot_text(symbol: str) -> str:
     time.sleep(0.03)
 
     try:
-        positions_resp = pack_stock_positions_response(
-            trade_ctx.stock_positions(symbols=[symbol])
-        )
+        positions_resp = pack_stock_positions_response(trade_ctx.stock_positions())
         positions = [
             position
             for channel in positions_resp.get("channels", [])
             for position in channel.get("positions", [])
         ]
-        snapshot["positions"] = {
+        snapshot["stock_positions"] = {
             "count": len(positions),
             "items": [
                 {
@@ -967,21 +966,21 @@ def _build_trade_snapshot_text(symbol: str) -> str:
             ],
         }
     except Exception as exc:
-        snapshot["positions"] = {"error": str(exc)}
+        snapshot["stock_positions"] = {"error": str(exc)}
 
     return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
 
 
 def on_candlestick(symbol: str, event: PushCandlestick):
 
-    global DAY_CANDLESTICK_COUNT
+    global day_candlestick_count
     if not event.is_confirmed:
         return
 
-    DAY_CANDLESTICK_COUNT += 1
+    day_candlestick_count += 1
 
     NEW_CANDLESTICK_TEXT = f"""
-    【时间】：{event.candlestick.timestamp.strftime("%Y-%m-%d %H:%M:%S")}，当前是今日的第{DAY_CANDLESTICK_COUNT}根K线。
+    【时间】：{event.candlestick.timestamp.strftime("%Y-%m-%d %H:%M:%S")}，当前是今日的第{day_candlestick_count}根K线。
     【OHLC】：{event.candlestick.open} {event.candlestick.high} {event.candlestick.low} {event.candlestick.close}
     【成交量】：{event.candlestick.volume}
     """

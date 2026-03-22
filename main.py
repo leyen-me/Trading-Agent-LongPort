@@ -21,7 +21,7 @@ from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config
 # self defined
 from config import Config
 from utils import pack_candlesticks, pack_quotes, parse_adjust_type, parse_period
-from utils.longport_trade_utils import pack_orders, pack_stock_positions_response
+from utils.longport_trade_utils import pack_orders
 from tools import (
     BaseTool,
     QuoteCandlesticksTool,
@@ -71,7 +71,8 @@ trading_agent = None
 
 day_candlestick_count = 0
 daily_market_context: Dict[str, Any] = {}
-last_daily_init_date: Optional[str] = None
+last_daily_reset_date: Optional[str] = None
+last_daily_context_refresh_date: Optional[str] = None
 _daily_init_lock = threading.Lock()
 
 PREMARKET_INIT_HOUR = 9
@@ -393,9 +394,21 @@ def _fetch_daily_market_context() -> Dict[str, Any]:
     return snapshot
 
 
+def _is_daily_market_context_valid(snapshot: Dict[str, Any]) -> bool:
+    """仅当昨收与 4 小时 K 线都成功获取时，才视为有效盘前上下文。"""
+    previous_close = snapshot.get("previous_close")
+    recent_4h_candlesticks = snapshot.get("recent_4h_candlesticks")
+    if not isinstance(previous_close, dict) or previous_close.get("error"):
+        return False
+    if not isinstance(recent_4h_candlesticks, list) or not recent_4h_candlesticks:
+        return False
+    return True
+
+
 def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
-    """每日 09:00 后重置 agent 上下文，并刷新低频市场背景。"""
-    global day_candlestick_count, daily_market_context, last_daily_init_date
+    """每日 09:00 后执行一次日切，并在成功时刷新低频市场背景。"""
+    global day_candlestick_count, daily_market_context
+    global last_daily_reset_date, last_daily_context_refresh_date
     if quote_ctx is None or trading_agent is None:
         return False
 
@@ -404,36 +417,64 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
     if not force and not _is_after_premarket_init_time(now):
         return False
 
+    did_reset = False
+    did_refresh_context = False
+    refresh_error = False
+
     with _daily_init_lock:
-        if not force and last_daily_init_date == today:
+        needs_reset = force or last_daily_reset_date != today
+        needs_context_refresh = force or last_daily_context_refresh_date != today
+
+        if not needs_reset and not needs_context_refresh:
             return False
 
-        daily_market_context = _fetch_daily_market_context()
-        last_daily_init_date = today
-        day_candlestick_count = 0
-        trading_agent.reset_conversation()
+        if needs_reset:
+            day_candlestick_count = 0
+            daily_market_context = {}
+            last_daily_reset_date = today
+            did_reset = True
 
-    logger.info("已完成每日盘前初始化: %s", today)
-    print_console_block(
-        "Daily Init",
-        [
+        if needs_context_refresh:
+            snapshot = _fetch_daily_market_context()
+            if _is_daily_market_context_valid(snapshot):
+                daily_market_context = snapshot
+                last_daily_context_refresh_date = today
+                did_refresh_context = True
+            else:
+                refresh_error = True
+                logger.warning("盘前上下文刷新失败，稍后会继续重试: %s", snapshot)
+
+        if did_reset:
+            trading_agent.reset_conversation()
+        elif did_refresh_context:
+            trading_agent._reload_system_prompt_from_disk()
+
+    if did_reset:
+        lines = [
             f"日期: {today}",
             "已清空 agent 上下文并重置日内 K 线计数。",
-            f"已加载昨收与最近 {DAILY_CONTEXT_4H_COUNT} 根 4 小时 K 线到运行时上下文。",
-        ],
-        color=PLAN_COLOR,
-    )
-    return True
+        ]
+        if did_refresh_context:
+            lines.append(f"已加载昨收与最近 {DAILY_CONTEXT_4H_COUNT} 根 4 小时 K 线到运行时上下文。")
+        elif refresh_error:
+            lines.append("盘前上下文刷新失败，当前已清空旧上下文，后续会在盘中继续重试。")
+        print_console_block("Daily Init", lines, color=PLAN_COLOR)
+        logger.info("已完成每日日切: %s", today)
+        return True
 
+    if did_refresh_context:
+        print_console_block(
+            "Daily Context Refreshed",
+            [
+                f"日期: {today}",
+                f"已补充加载昨收与最近 {DAILY_CONTEXT_4H_COUNT} 根 4 小时 K 线到运行时上下文。",
+            ],
+            color=PLAN_COLOR,
+        )
+        logger.info("已补充刷新每日盘前上下文: %s", today)
+        return True
 
-def run_daily_initializer_loop(poll_interval_seconds: int = 15) -> None:
-    """后台轮询时间，到点后执行每日初始化。"""
-    while True:
-        try:
-            initialize_trading_day_if_needed()
-        except Exception:
-            logger.exception("每日盘前初始化失败")
-        time.sleep(poll_interval_seconds)
+    return False
 
 
 def with_runtime_context(
@@ -1029,32 +1070,7 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
     except Exception as exc:
         snapshot["orders"] = {"error": str(exc)}
 
-    # 30 秒内累计不超过 30 次调用，且每两次调用之间间隔不小于 0.02 秒
-    time.sleep(0.03)
-
-    try:
-        positions_resp = pack_stock_positions_response(trade_ctx.stock_positions())
-        positions = [
-            position
-            for channel in positions_resp.get("channels", [])
-            for position in channel.get("positions", [])
-        ]
-        snapshot["stock_positions"] = {
-            "count": len(positions),
-            "items": [
-                {
-                    "symbol": position["symbol"],
-                    "symbol_name": position["symbol_name"],
-                    "quantity": position["quantity"],
-                    "available_quantity": position["available_quantity"],
-                    "cost_price": position["cost_price"],
-                    "currency": position["currency"],
-                }
-                for position in positions
-            ],
-        }
-    except Exception as exc:
-        snapshot["stock_positions"] = {"error": str(exc)}
+    snapshot["positions_notice"] = "未注入持仓信息：当前仅接入 stock_positions，无法准确代表衍生品持仓。"
 
     return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
 
@@ -1082,12 +1098,6 @@ def main() -> None:
     trade_ctx = TradeContext(LongPortConfig.from_env())
     trading_agent = TradingAgent()
     initialize_trading_day_if_needed()
-
-    threading.Thread(
-        target=run_daily_initializer_loop,
-        name="daily-initializer",
-        daemon=True,
-    ).start()
 
     quote_ctx.set_on_candlestick(on_candlestick)
     quote_ctx.subscribe_candlesticks(Config.TRADE_SYMBOL, parse_period(Config.TRADE_CYCLE), TradeSessions.Intraday)

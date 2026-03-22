@@ -64,10 +64,10 @@ class Config:
     # 上下文窗口大小覆盖，留空则使用默认或模型内置
     OPENAI_CONTEXT_WINDOW = _optional_int("OPENAI_CONTEXT_WINDOW") or _optional_int("MODEL_CONTEXT_WINDOW")
     # 默认上下文窗口大小
-    DEFAULT_CONTEXT_WINDOW = int(os.getenv("DEFAULT_CONTEXT_WINDOW", "200000"))
+    DEFAULT_CONTEXT_WINDOW = int(os.getenv("DEFAULT_CONTEXT_WINDOW", "256000"))
     # 模型特定上下文窗口，格式：model1:size1,model2:size2
     MODEL_CONTEXT_WINDOWS = _parse_model_context_windows(os.getenv("MODEL_CONTEXT_WINDOW_OVERRIDES", "minimax-m2.5:204800,minimax-m2.5-highspeed:204800"))
     # 交易标的
-    TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "QQQ")
+    TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "QQQ.US")
     # 交易周期
     TRADE_CYCLE = os.getenv("TRADE_CYCLE", "min_5")

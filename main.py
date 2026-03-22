@@ -5,6 +5,7 @@ import logging
 import os
 import platform
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -19,7 +20,7 @@ from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config
 
 # self defined
 from config import Config
-from utils import parse_period
+from utils import pack_candlesticks, pack_quotes, parse_adjust_type, parse_period
 from utils.longport_trade_utils import pack_orders, pack_stock_positions_response
 from tools import (
     BaseTool,
@@ -69,6 +70,13 @@ quote_ctx: QuoteContext = None
 trading_agent = None
 
 day_candlestick_count = 0
+daily_market_context: Dict[str, Any] = {}
+last_daily_init_date: Optional[str] = None
+_daily_init_lock = threading.Lock()
+
+PREMARKET_INIT_HOUR = 9
+PREMARKET_INIT_MINUTE = 0
+DAILY_CONTEXT_4H_COUNT = 8
 
 
 
@@ -334,14 +342,99 @@ def messages_for_api(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
     """构造注入到 system prompt 中的运行时环境信息。"""
-    return "\n".join(
+    lines = [
+        "  <runtime_context>",
+        f"    <symbol>{escape(Config.TRADE_SYMBOL)}</symbol>",
+        f"    <cycle>{escape(Config.TRADE_CYCLE)}</cycle>",
+    ]
+    if daily_market_context:
+        lines.extend(
+            [
+                "    <daily_context_refresh_policy>以下盘前上下文仅在每日 09:00 初始化时刷新，盘中不自动更新。</daily_context_refresh_policy>",
+                f"    <daily_market_context>{escape(json.dumps(daily_market_context, ensure_ascii=False, separators=(',', ':')))}</daily_market_context>",
+            ]
+        )
+    lines.append("  </runtime_context>")
+    return "\n".join(lines)
+
+
+def _is_after_premarket_init_time(now: datetime) -> bool:
+    return (now.hour, now.minute) >= (PREMARKET_INIT_HOUR, PREMARKET_INIT_MINUTE)
+
+
+def _fetch_daily_market_context() -> Dict[str, Any]:
+    """查询每日低频背景信息，供 system prompt 注入。"""
+    snapshot: Dict[str, Any] = {
+        "symbol": Config.TRADE_SYMBOL,
+        "initialized_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "four_hour_period": "min_240",
+        "four_hour_count": DAILY_CONTEXT_4H_COUNT,
+    }
+
+    try:
+        quotes = pack_quotes(quote_ctx.quote([Config.TRADE_SYMBOL]))
+        snapshot["previous_close"] = quotes[0] if quotes else {"error": "未获取到实时行情"}
+    except Exception as exc:
+        snapshot["previous_close"] = {"error": str(exc)}
+
+    try:
+        rows = quote_ctx.candlesticks(
+            Config.TRADE_SYMBOL,
+            parse_period("min_240"),
+            DAILY_CONTEXT_4H_COUNT,
+            parse_adjust_type("NoAdjust"),
+        )
+        snapshot["recent_4h_candlesticks"] = pack_candlesticks(
+            Config.TRADE_SYMBOL,
+            rows,
+        )["candlesticks"]
+    except Exception as exc:
+        snapshot["recent_4h_candlesticks"] = {"error": str(exc)}
+
+    return snapshot
+
+
+def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
+    """每日 09:00 后重置 agent 上下文，并刷新低频市场背景。"""
+    global day_candlestick_count, daily_market_context, last_daily_init_date
+    if quote_ctx is None or trading_agent is None:
+        return False
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if not force and not _is_after_premarket_init_time(now):
+        return False
+
+    with _daily_init_lock:
+        if not force and last_daily_init_date == today:
+            return False
+
+        daily_market_context = _fetch_daily_market_context()
+        last_daily_init_date = today
+        day_candlestick_count = 0
+        trading_agent.reset_conversation()
+
+    logger.info("已完成每日盘前初始化: %s", today)
+    print_console_block(
+        "Daily Init",
         [
-            "  <runtime_context>",
-            f"    <symbol>{escape(Config.TRADE_SYMBOL)}</symbol>",
-            f"    <cycle>{escape(Config.TRADE_CYCLE)}</cycle>",
-            "  </runtime_context>",
-        ]
+            f"日期: {today}",
+            "已清空 agent 上下文并重置日内 K 线计数。",
+            f"已加载昨收与最近 {DAILY_CONTEXT_4H_COUNT} 根 4 小时 K 线到运行时上下文。",
+        ],
+        color=PLAN_COLOR,
     )
+    return True
+
+
+def run_daily_initializer_loop(poll_interval_seconds: int = 15) -> None:
+    """后台轮询时间，到点后执行每日初始化。"""
+    while True:
+        try:
+            initialize_trading_day_if_needed()
+        except Exception:
+            logger.exception("每日盘前初始化失败")
+        time.sleep(poll_interval_seconds)
 
 
 def with_runtime_context(
@@ -973,6 +1066,7 @@ def on_candlestick(symbol: str, event: PushCandlestick):
     if not event.is_confirmed:
         return
 
+    initialize_trading_day_if_needed()
     day_candlestick_count += 1
 
     NEW_CANDLESTICK_TEXT = f"""
@@ -988,6 +1082,13 @@ def main() -> None:
     quote_ctx = QuoteContext(LongPortConfig.from_env())
     trade_ctx = TradeContext(LongPortConfig.from_env())
     trading_agent = TradingAgent()
+    initialize_trading_day_if_needed()
+
+    threading.Thread(
+        target=run_daily_initializer_loop,
+        name="daily-initializer",
+        daemon=True,
+    ).start()
 
     quote_ctx.set_on_candlestick(on_candlestick)
     quote_ctx.subscribe_candlesticks(Config.TRADE_SYMBOL, parse_period(Config.TRADE_CYCLE), TradeSessions.Intraday)

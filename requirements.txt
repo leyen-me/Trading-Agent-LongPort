@@ -1,2 +1,3 @@
 flask-cors==6.0.1
 longport==3.0.14
+openai

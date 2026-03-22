@@ -1,0 +1,7 @@
+__pycache__/
+.git/
+.agent/
+.venv/
+*.pyc
+*.pyo
+*.pyd

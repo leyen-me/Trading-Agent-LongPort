@@ -12,7 +12,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from longport.openapi import Candlestick, PrePostQuote, SecurityQuote
+from longport.openapi import Candlestick, PrePostQuote, SecurityQuote, StrikePriceInfo
 
 
 def _scalar(value: Any) -> Any:
@@ -85,3 +85,21 @@ def pack_candlesticks(symbol: str, rows: List[Candlestick]) -> Dict[str, List[Ca
         "symbol": symbol,
         "candlesticks": [pack_candlestick(x) for x in rows],
     }
+
+
+def pack_option_expiry_dates(dates: List[date]) -> Dict[str, Any]:
+    """对应 LongPort「期权链到期日列表」：expiry_date 为 YYYYMMDD 字符串列表。"""
+    return {"expiry_date": [d.strftime("%Y%m%d") for d in dates]}
+
+
+def pack_strike_price_info(row: StrikePriceInfo) -> Dict[str, Any]:
+    return {
+        "price": _scalar(row.price),
+        "call_symbol": _scalar(row.call_symbol),
+        "put_symbol": _scalar(row.put_symbol),
+        "standard": _scalar(row.standard),
+    }
+
+
+def pack_option_chain_info_by_date(rows: List[StrikePriceInfo]) -> Dict[str, Any]:
+    return {"strike_price_info": [pack_strike_price_info(x) for x in rows]}

@@ -3,6 +3,8 @@ from .TradingPhilosophyTool import TradingPhilosophyTool
 from .quote import (
     LongPortQuoteTool,
     QuoteCandlesticksTool,
+    QuoteOptionChainExpiryDatesTool,
+    QuoteOptionChainInfoByDateTool,
     QuoteRealtimeTool,
 )
 from .trade import (
@@ -25,6 +27,8 @@ __all__ = [
     "LongPortQuoteTool",
     "LongPortTradeTool",
     "QuoteCandlesticksTool",
+    "QuoteOptionChainExpiryDatesTool",
+    "QuoteOptionChainInfoByDateTool",
     "QuoteRealtimeTool",
     "TradeAccountBalanceTool",
     "TradeCancelOrderTool",

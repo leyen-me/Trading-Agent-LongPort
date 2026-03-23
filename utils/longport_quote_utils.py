@@ -82,6 +82,16 @@ def parse_date(value: Optional[str]) -> Optional[date]:
     return parsed.date() if parsed else None
 
 
+def validate_expiry_date(value: Any) -> date:
+    """解析期权到期日，供 option_chain_info_by_date 使用。支持 YYYY-MM-DD、YYYYMMDD 等 parse_date 可识别的格式。"""
+    if value is None or str(value).strip() == "":
+        raise ValueError("expiry_date 不能为空")
+    parsed = parse_date(str(value).strip())
+    if parsed is None:
+        raise ValueError("expiry_date 格式不合法，支持 YYYY-MM-DD、YYYYMMDD（与 LongPort 文档一致）")
+    return parsed
+
+
 def validate_symbol(symbol: Any) -> str:
     normalized = str(symbol).strip()
     if not normalized:

@@ -25,6 +25,8 @@ from utils.longport_trade_utils import pack_orders
 from tools import (
     BaseTool,
     QuoteCandlesticksTool,
+    QuoteOptionChainExpiryDatesTool,
+    QuoteOptionChainInfoByDateTool,
     QuoteRealtimeTool,
     TradingPhilosophyTool,
     TradeAccountBalanceTool,
@@ -268,19 +270,27 @@ def build_trading_agent_system_prompt() -> str:
   </hard_constraints>
 
   <available_tools>
-    <tool>trading_philosophy</tool>
-    <tool>quote_realtime</tool>
-    <tool>quote_candlesticks</tool>
-    <tool>trade_account_balance</tool>
-    <tool>trade_estimate_buy_limit</tool>
-    <tool>trade_history_orders</tool>
-    <tool>trade_order_detail</tool>
-    <tool>trade_stock_positions</tool>
-    <tool>trade_today_orders</tool>
-    <tool>trade_replace_order</tool>
-    <tool>trade_submit_order</tool>
-    <tool>trade_cancel_order</tool>
-    <tool>trade_stop_order</tool>
+    <group name="更新交易思想">
+      <tool>trading_philosophy</tool>
+    </group>
+    <group name="行情工具">
+      <tool>quote_realtime</tool>
+      <tool>quote_candlesticks</tool>
+      <tool>quote_option_chain_expiry_dates</tool>
+      <tool>quote_option_chain_info_by_date</tool>
+    </group>
+    <group name="交易工具">
+      <tool>trade_account_balance</tool>
+      <tool>trade_estimate_buy_limit</tool>
+      <tool>trade_history_orders</tool>
+      <tool>trade_order_detail</tool>
+      <tool>trade_stock_positions</tool>
+      <tool>trade_today_orders</tool>
+      <tool>trade_replace_order</tool>
+      <tool>trade_submit_order</tool>
+      <tool>trade_cancel_order</tool>
+      <tool>trade_stop_order</tool>
+    </group>
   </available_tools>
 
   <tool_call_policy>
@@ -1072,6 +1082,8 @@ class TradingAgent(BaseAgent):
         self.register_tool(TradingPhilosophyTool(TRADING_PHILOSOPHY_FILE))
         self.register_tool(QuoteRealtimeTool(qp))
         self.register_tool(QuoteCandlesticksTool(qp))
+        self.register_tool(QuoteOptionChainExpiryDatesTool(qp))
+        self.register_tool(QuoteOptionChainInfoByDateTool(qp))
         for tool_cls in _READ_ONLY_TRADE_TOOL_CLASSES:
             self.register_tool(tool_cls(tp))
         for tool_cls in _MUTATING_TRADE_TOOL_CLASSES:

@@ -310,14 +310,28 @@ def pack_order_detail(d: OrderDetail) -> dict[str, Any]:
     return base
 
 
+def _norm_currency_code(value: Optional[str]) -> str:
+    return (value or "").strip().upper()
+
+
 def _available_cash_for_currency(b: AccountBalance, currency: str) -> Any:
-    """Pick available_cash from cash_infos for currency, else first row."""
-    for c in b.cash_infos:
-        if c.currency == currency:
+    """
+    Pick available_cash from cash_infos for the requested currency (case-insensitive).
+    If no row matches, prefer the row for the account primary currency (b.currency),
+    then the first row — so we do not pick a wrong currency when order differs from API.
+    """
+    want = _norm_currency_code(currency)
+    primary = _norm_currency_code(b.currency)
+    rows = b.cash_infos or []
+    if not rows:
+        return None
+    for c in rows:
+        if _norm_currency_code(c.currency) == want:
             return scalar_to_json(c.available_cash)
-    if b.cash_infos:
-        return scalar_to_json(b.cash_infos[0].available_cash)
-    return None
+    for c in rows:
+        if _norm_currency_code(c.currency) == primary:
+            return scalar_to_json(c.available_cash)
+    return scalar_to_json(rows[0].available_cash)
 
 
 def pack_account_balance(
@@ -329,7 +343,7 @@ def pack_account_balance(
     Three fields: net_assets, available cash (by currency), buy_power.
     If available_currency matches the tool request, use it for available; else b.currency.
     """
-    ccy = (available_currency or "").strip() or b.currency
+    ccy = _norm_currency_code(available_currency) or b.currency
     return {
         "net_assets": scalar_to_json(b.net_assets),
         "available": _available_cash_for_currency(b, ccy),

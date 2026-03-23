@@ -71,3 +71,7 @@ class Config:
     TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "QQQ.US")
     # 交易周期
     TRADE_CYCLE = os.getenv("TRADE_CYCLE", "min_5")
+    # trade_account_balance 未传 currency 时使用的默认币种（与 LongPort account_balance(currency=...) 一致）
+    DEFAULT_ACCOUNT_BALANCE_CURRENCY = (
+        os.getenv("DEFAULT_ACCOUNT_BALANCE_CURRENCY", "USD").strip().upper() or "USD"
+    )

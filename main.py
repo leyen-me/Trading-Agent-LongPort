@@ -14,6 +14,10 @@ from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# 仅跑 TEST_TRADE_ACCOUNT_BALANCE 时不依赖真实 OPENAI_API_KEY（Config 在 import 时校验）
+if __name__ == "__main__" and os.environ.get("TEST_TRADE_ACCOUNT_BALANCE"):
+    os.environ.setdefault("OPENAI_API_KEY", "unused-for-balance-test-only")
+
 # third party
 from openai import OpenAI
 from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config as LongPortConfig, TradeSessions
@@ -1200,7 +1204,36 @@ def main() -> None:
     quote_ctx.subscribe_candlesticks(Config.TRADE_SYMBOL, parse_period(Config.TRADE_CYCLE), TradeSessions.Intraday)
 
 
+def _test_trade_account_balance_tool() -> None:
+    """
+    调试 trade_account_balance：打印 SDK 原始 AccountBalance 与工具输出。
+    用法：TEST_TRADE_ACCOUNT_BALANCE=1 python main.py
+    """
+    global trade_ctx
+    cfg = LongPortConfig.from_env()
+    trade_ctx = TradeContext(cfg)
+    tool = TradeAccountBalanceTool(lambda: trade_ctx)
+    raw_rows = trade_ctx.account_balance()
+    print("=== [account_balance] 原始 SDK 返回 ===")
+    for i, b in enumerate(raw_rows):
+        print(f"  [{i}] account currency={b.currency!r} net_assets={b.net_assets} "
+              f"total_cash={b.total_cash} buy_power={b.buy_power}")
+        for ci in b.cash_infos:
+            print(
+                f"      cash_infos: {ci.currency!r} available_cash={ci.available_cash} "
+                f"frozen_cash={ci.frozen_cash} settling_cash={ci.settling_cash}"
+            )
+    print("=== [trade_account_balance] 工具无 currency ===")
+    print(tool.run({}))
+    for ccy in ("USD", "HKD", "CNH"):
+        print(f"=== [trade_account_balance] currency={ccy} ===")
+        print(tool.run({"currency": ccy}))
+
+
 if __name__ == "__main__":
+    if os.environ.get("TEST_TRADE_ACCOUNT_BALANCE"):
+        _test_trade_account_balance_tool()
+        sys.exit(0)
     main()
     while True:
         time.sleep(1)

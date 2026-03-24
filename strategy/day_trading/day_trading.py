@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # third party
-from openai import OpenAI
+from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config as LongPortConfig, TradeSessions
 
 # self defined
@@ -87,6 +87,28 @@ PREMARKET_INIT_HOUR = 9
 PREMARKET_INIT_MINUTE = 0
 DAILY_CONTEXT_4H_COUNT = 8
 POST_CLOSE_IDLE_SECONDS = 60 * 60
+
+
+def _get_positive_int_env(key: str, default: int) -> int:
+    raw = str(os.getenv(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+MAX_API_MESSAGES = _get_positive_int_env("DAY_TRADING_MAX_API_MESSAGES", 36)
+RATE_LIMIT_COOLDOWN_SECONDS = _get_positive_int_env(
+    "DAY_TRADING_RATE_LIMIT_COOLDOWN_SECONDS",
+    180,
+)
+API_ERROR_COOLDOWN_SECONDS = _get_positive_int_env(
+    "DAY_TRADING_API_ERROR_COOLDOWN_SECONDS",
+    60,
+)
 
 
 
@@ -298,10 +320,12 @@ def build_trading_agent_system_prompt() -> str:
     <rule>需要行情或账户信息时先调用相应查询工具，再决策；多步操作在同一轮对话内顺序完成。</rule>
     <rule>未完成必要工具调用前避免冗长臆测性总结。</rule>
     <rule>盘后复盘或修订交易思想时，请使用 trading_philosophy 更新交易思想文件。</rule>
+    <rule>只总结与当前交易标的直接相关的订单、持仓与执行结果；其他标的除非有明确影响，否则不要展开。</rule>
   </tool_call_policy>
 
   <output_contract>
     <rule>在工具结果已覆盖关键事实后，给出简洁、可核对的结论。</rule>
+    <rule>盘中常规响应默认限制在 3-6 条短要点内；除非明确需要，不要输出表格、重复模板和大段免责声明。</rule>
   </output_contract>
 </system>
 """.strip()
@@ -348,14 +372,38 @@ def assistant_message_with_reasoning(
 
 
 def messages_for_api(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """OpenAI Chat Completions 不接受自定义 reasoning 字段，请求前剥掉。"""
-    out: List[Dict[str, Any]] = []
-    for m in messages:
-        if isinstance(m, dict) and m.get("role") == "assistant" and "reasoning" in m:
-            out.append({k: v for k, v in m.items() if k != "reasoning"})
+    """请求前移除 reasoning，并裁剪过长上下文，避免会话无限膨胀。"""
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant" and "reasoning" in message:
+            normalized.append({k: v for k, v in message.items() if k != "reasoning"})
         else:
-            out.append(m)
-    return out
+            normalized.append(message)
+
+    if len(normalized) <= MAX_API_MESSAGES:
+        return normalized
+
+    keep_system = bool(normalized) and normalized[0].get("role") == "system"
+    system_offset = 1 if keep_system else 0
+    suffix_budget = max(MAX_API_MESSAGES - system_offset, 1)
+    start = max(system_offset, len(normalized) - suffix_budget)
+
+    # 不要让裁剪后的上下文从孤立 tool 消息开始，否则可能破坏 tool_call 链路。
+    while start > system_offset and normalized[start].get("role") == "tool":
+        start -= 1
+
+    trimmed = normalized[start:]
+    summary_note = {
+        "role": "system",
+        "content": (
+            f"注意：为控制上下文长度，已省略更早的 {start - system_offset} 条历史消息。"
+            "请优先依据保留的近期消息、运行时上下文和最新工具结果继续。"
+        ),
+    }
+
+    if keep_system:
+        return [normalized[0], summary_note, *trimmed]
+    return [summary_note, *trimmed]
 
 
 def build_runtime_context_xml(agent_name: str, model_name: str) -> str:
@@ -703,6 +751,7 @@ class BaseAgent:
         ]
         self.messages: List[Dict[str, Any]] = list(self.base_messages)
         self.latest_usage: Optional[UsageSnapshot] = None
+        self.api_cooldown_until = 0.0
 
     def register_tool(self, tool: BaseTool) -> None:
         self.tools.append(tool)
@@ -857,6 +906,16 @@ class BaseAgent:
         """将当前会话恢复到仅含 system prompt 的初始状态。"""
         self.messages = list(self.base_messages)
         self.latest_usage = None
+        self.api_cooldown_until = 0.0
+
+    def _remaining_api_cooldown(self) -> int:
+        return max(int(self.api_cooldown_until - time.time()), 0)
+
+    def _append_failure_message(self, text: str, *, silent: bool) -> str:
+        self.messages.append({"role": "assistant", "content": text})
+        if not silent:
+            print(f"\n{color_text(f'{self.agent_name}：', self.agent_color)}{text}", flush=True)
+        return text
 
     def chat(
         self,
@@ -874,6 +933,14 @@ class BaseAgent:
 
         stop_after_tool_names = set(stop_after_tool_names or [])
         self.messages.append({"role": "user", "content": message})
+
+        remaining_cooldown = self._remaining_api_cooldown()
+        if remaining_cooldown > 0:
+            return self._append_failure_message(
+                f"[系统提示] 模型接口冷却中，约 {remaining_cooldown} 秒后再试；本轮仅记录事件，不继续发起分析。",
+                silent=silent,
+            )
+
         tools = self.get_tools()
         api_kwargs: Dict[str, Any] = {
             "model": self.model,
@@ -892,160 +959,182 @@ class BaseAgent:
             api_kwargs["tool_choice"] = "auto"
 
         while True:
-            api_kwargs["messages"] = messages_for_api(self.messages)
-            stream = self.client.chat.completions.create(**api_kwargs)
+            try:
+                api_kwargs["messages"] = messages_for_api(self.messages)
+                stream = self.client.chat.completions.create(**api_kwargs)
 
-            content_parts: List[str] = []
-            reasoning_parts: List[str] = []
-            tool_call_acc: Dict[str, Dict[str, str]] = {}
-            last_tool_call_id: Optional[str] = None
+                content_parts: List[str] = []
+                reasoning_parts: List[str] = []
+                tool_call_acc: Dict[str, Dict[str, str]] = {}
+                last_tool_call_id: Optional[str] = None
 
-            if not silent:
-                print(
-                    f"\n{color_text(f'{self.agent_name}：', self.agent_color)}",
-                    end="",
-                    flush=True,
-                )
-            tool_call_started = False  # 是否已输出过工具调用前缀
-            reasoning_started = False
-            answer_started = False
-            for chunk in stream:
-                usage = getattr(chunk, "usage", None)
-                if usage is not None:
-                    self.update_usage_snapshot(usage)
-
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                logger.info(delta)
-
-                reasoning_text = self.get_reasoning_delta_text(delta)
-                if reasoning_text:
-                    reasoning_parts.append(reasoning_text)
-                if reasoning_text and not silent:
-                    if not reasoning_started:
-                        print(
-                            "\n"
-                            + color_text("【思考】", REASONING_COLOR)
-                            + " ",
-                            end="",
-                            flush=True,
-                        )
-                        reasoning_started = True
+                if not silent:
                     print(
-                        color_text(reasoning_text, REASONING_COLOR),
+                        f"\n{color_text(f'{self.agent_name}：', self.agent_color)}",
                         end="",
                         flush=True,
                     )
+                tool_call_started = False  # 是否已输出过工具调用前缀
+                reasoning_started = False
+                answer_started = False
+                for chunk in stream:
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        self.update_usage_snapshot(usage)
 
-                if hasattr(delta, "content") and delta.content:
-                    content_parts.append(delta.content)
-                    if not silent:
-                        if reasoning_started and not answer_started:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("stream delta: %s", delta)
+
+                    reasoning_text = self.get_reasoning_delta_text(delta)
+                    if reasoning_text:
+                        reasoning_parts.append(reasoning_text)
+                    if reasoning_text and not silent:
+                        if not reasoning_started:
                             print(
                                 "\n"
-                                + color_text("【回答】", self.agent_color)
+                                + color_text("【思考】", REASONING_COLOR)
                                 + " ",
                                 end="",
                                 flush=True,
                             )
-                            answer_started = True
-                        print(delta.content, end="", flush=True)
-
-                if hasattr(delta, "tool_calls") and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        tc_id = tc.id or last_tool_call_id
-                        if tc_id is None:
-                            continue
-                        last_tool_call_id = tc_id
-                        if tc_id not in tool_call_acc:
-                            tool_call_acc[tc_id] = {
-                                "id": tc_id,
-                                "name": "",
-                                "arguments": "",
-                            }
-                            if not silent:
-                                if reasoning_started and not answer_started:
-                                    print("\n", end="", flush=True)
-                                    answer_started = True
-                                if not tool_call_started:
-                                    print("【工具调用】", end="", flush=True)
-                                    tool_call_started = True
-                                else:
-                                    print("\n【工具调用】", end="", flush=True)
-                        if tc.function:
-                            if tc.function.name:
-                                tool_call_acc[tc_id]["name"] += tc.function.name
-                                if not silent:
-                                    print(tc.function.name, end="", flush=True)
-                            if tc.function.arguments:
-                                tool_call_acc[tc_id][
-                                    "arguments"
-                                ] += tc.function.arguments
-                                if not silent:
-                                    print(tc.function.arguments, end="", flush=True)
-
-            full_content = "".join(content_parts)
-
-            if tool_call_acc:
-                if not silent:
-                    print()  # 工具调用流式输出后换行
-                tool_calls_list = [
-                    {
-                        "id": data["id"],
-                        "type": "function",
-                        "function": {
-                            "name": data["name"],
-                            "arguments": data["arguments"],
-                        },
-                    }
-                    for data in tool_call_acc.values()
-                ]
-                self.messages.append(
-                    assistant_message_with_reasoning(
-                        full_content,
-                        reasoning_parts,
-                        tool_calls=tool_calls_list,
-                    )
-                )
-                for call in tool_calls_list:
-                    result = self.execute_tool(
-                        call["function"]["name"],
-                        call["function"]["arguments"],
-                    )
-                    if not silent:
+                            reasoning_started = True
                         print(
-                            f"【工具结果】{call['function']['name']} -> "
-                            f"{self.format_tool_result(result)}",
+                            color_text(reasoning_text, REASONING_COLOR),
+                            end="",
                             flush=True,
                         )
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": result,
-                        }
-                    )
-                if any(
-                    call["function"]["name"] in stop_after_tool_names
-                    for call in tool_calls_list
-                ):
+
+                    if hasattr(delta, "content") and delta.content:
+                        content_parts.append(delta.content)
+                        if not silent:
+                            if reasoning_started and not answer_started:
+                                print(
+                                    "\n"
+                                    + color_text("【回答】", self.agent_color)
+                                    + " ",
+                                    end="",
+                                    flush=True,
+                                )
+                                answer_started = True
+                            print(delta.content, end="", flush=True)
+
+                    if hasattr(delta, "tool_calls") and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            tc_id = tc.id or last_tool_call_id
+                            if tc_id is None:
+                                continue
+                            last_tool_call_id = tc_id
+                            if tc_id not in tool_call_acc:
+                                tool_call_acc[tc_id] = {
+                                    "id": tc_id,
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                                if not silent:
+                                    if reasoning_started and not answer_started:
+                                        print("\n", end="", flush=True)
+                                        answer_started = True
+                                    if not tool_call_started:
+                                        print("【工具调用】", end="", flush=True)
+                                        tool_call_started = True
+                                    else:
+                                        print("\n【工具调用】", end="", flush=True)
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_call_acc[tc_id]["name"] += tc.function.name
+                                    if not silent:
+                                        print(tc.function.name, end="", flush=True)
+                                if tc.function.arguments:
+                                    tool_call_acc[tc_id]["arguments"] += tc.function.arguments
+                                    if not silent:
+                                        print(tc.function.arguments, end="", flush=True)
+
+                full_content = "".join(content_parts)
+
+                if tool_call_acc:
                     if not silent:
-                        print()
+                        print()  # 工具调用流式输出后换行
+                    tool_calls_list = [
+                        {
+                            "id": data["id"],
+                            "type": "function",
+                            "function": {
+                                "name": data["name"],
+                                "arguments": data["arguments"],
+                            },
+                        }
+                        for data in tool_call_acc.values()
+                    ]
+                    self.messages.append(
+                        assistant_message_with_reasoning(
+                            full_content,
+                            reasoning_parts,
+                            tool_calls=tool_calls_list,
+                        )
+                    )
+                    for call in tool_calls_list:
+                        result = self.execute_tool(
+                            call["function"]["name"],
+                            call["function"]["arguments"],
+                        )
+                        if not silent:
+                            print(
+                                f"【工具结果】{call['function']['name']} -> "
+                                f"{self.format_tool_result(result)}",
+                                flush=True,
+                            )
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": result,
+                            }
+                        )
+                    if any(
+                        call["function"]["name"] in stop_after_tool_names
+                        for call in tool_calls_list
+                    ):
+                        if not silent:
+                            print()
+                        return full_content
+                    continue
+
+                if full_content or reasoning_parts:
+                    self.api_cooldown_until = 0.0
+                    self.messages.append(
+                        assistant_message_with_reasoning(full_content, reasoning_parts)
+                    )
+                    if not silent:
+                        print()  # 流式输出后换行
                     return full_content
-                continue
 
-            if full_content or reasoning_parts:
-                self.messages.append(
-                    assistant_message_with_reasoning(full_content, reasoning_parts)
+                # 空响应时避免死循环
+                logger.warning("API 返回空响应")
+                return ""
+            except RateLimitError as exc:
+                self.api_cooldown_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
+                logger.warning("模型接口触发限流，进入冷却: %s", exc)
+                return self._append_failure_message(
+                    f"[系统提示] 模型接口触发限流，本轮已跳过，并进入 {RATE_LIMIT_COOLDOWN_SECONDS} 秒冷却。",
+                    silent=silent,
                 )
-                if not silent:
-                    print()  # 流式输出后换行
-                return full_content
-
-            # 空响应时避免死循环
-            logger.warning("API 返回空响应")
-            return ""
+            except (APITimeoutError, APIError) as exc:
+                self.api_cooldown_until = time.time() + API_ERROR_COOLDOWN_SECONDS
+                logger.warning("模型接口调用失败，进入短冷却: %s", exc)
+                return self._append_failure_message(
+                    f"[系统提示] 模型接口暂时不可用，本轮已跳过，并进入 {API_ERROR_COOLDOWN_SECONDS} 秒冷却。",
+                    silent=silent,
+                )
+            except Exception as exc:
+                self.api_cooldown_until = time.time() + API_ERROR_COOLDOWN_SECONDS
+                logger.exception("模型对话失败")
+                return self._append_failure_message(
+                    f"[系统提示] 本轮分析异常中断：{exc}",
+                    silent=silent,
+                )
 
 
 # ==== TradingAgent ====
@@ -1147,8 +1236,22 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
 
     try:
         orders = pack_orders(trade_ctx.today_orders())
+        normalized_symbol = str(trigger_symbol).upper()
+        related_orders = [
+            order for order in orders
+            if str(order.get("symbol", "")).upper() == normalized_symbol
+        ]
+        other_symbols = sorted(
+            {
+                str(order.get("symbol", "")).upper()
+                for order in orders
+                if str(order.get("symbol", "")).upper() != normalized_symbol
+                and order.get("symbol")
+            }
+        )
         snapshot["orders"] = {
-            "count": len(orders),
+            "count": len(related_orders),
+            "all_count": len(orders),
             "items": [
                 {
                     "order_id": order["order_id"],
@@ -1159,9 +1262,11 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
                     "price": order["price"],
                     "symbol": order["symbol"],
                 }
-                for order in orders[-5:]
+                for order in related_orders[-5:]
             ],
         }
+        if other_symbols:
+            snapshot["orders"]["other_symbols"] = other_symbols
     except Exception as exc:
         snapshot["orders"] = {"error": str(exc)}
 
@@ -1171,40 +1276,45 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
 
 
 def on_candlestick(symbol: str, event: PushCandlestick):
-
     global day_candlestick_count
-    if not event.is_confirmed:
-        return
+    try:
+        if not event.is_confirmed:
+            return
 
-    initialize_trading_day_if_needed()
-    trade_date_text = event.candlestick.timestamp.strftime("%Y-%m-%d")
-    _refresh_post_close_review_timer(trade_date_text)
-    day_candlestick_count += 1
+        initialize_trading_day_if_needed()
+        trade_date_text = event.candlestick.timestamp.strftime("%Y-%m-%d")
+        _refresh_post_close_review_timer(trade_date_text)
+        day_candlestick_count += 1
 
-    NEW_CANDLESTICK_TEXT = f"""
+        NEW_CANDLESTICK_TEXT = f"""
     【时间】：{event.candlestick.timestamp.strftime("%Y-%m-%d %H:%M:%S")}，当前是今日的第{day_candlestick_count}根K线。
     【OHLC】：{event.candlestick.open} {event.candlestick.high} {event.candlestick.low} {event.candlestick.close}
     【成交量】：{event.candlestick.volume}
     """
-    TRADE_SNAPSHOT_TEXT = f"【当前交易状态摘要】：{_build_trade_snapshot_text(symbol)}"
-    with _agent_operation_lock:
-        trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + TRADE_SNAPSHOT_TEXT)
+        TRADE_SNAPSHOT_TEXT = f"【当前交易状态摘要】：{_build_trade_snapshot_text(symbol)}"
+        with _agent_operation_lock:
+            trading_agent.chat(NEW_CANDLESTICK_TEXT + "\n" + TRADE_SNAPSHOT_TEXT)
+    except Exception:
+        logger.exception("处理 K 线回调失败: %s", symbol)
 
 
 def on_jin10_news(items: List[Dict[str, Any]]) -> None:
     """接收金十快讯推送，汇总后注入 agent。"""
-    if not items or trading_agent is None:
-        return
-    lines = []
-    for i, item in enumerate(items[:5], 1):  # 最多 5 条，避免上下文过长
-        content = (item.get("data") or {}).get("content", "")
-        if content:
-            lines.append(f"{i}. {content[:200]}{'...' if len(content) > 200 else ''}")
-    if not lines:
-        return
-    text = "【金十快讯】收到新快讯：\n" + "\n".join(lines)
-    with _agent_operation_lock:
-        trading_agent.chat(text, silent=True)
+    try:
+        if not items or trading_agent is None:
+            return
+        lines = []
+        for i, item in enumerate(items[:5], 1):  # 最多 5 条，避免上下文过长
+            content = (item.get("data") or {}).get("content", "")
+            if content:
+                lines.append(f"{i}. {content[:200]}{'...' if len(content) > 200 else ''}")
+        if not lines:
+            return
+        text = "【金十快讯】收到新快讯：\n" + "\n".join(lines)
+        with _agent_operation_lock:
+            trading_agent.chat(text, silent=True)
+    except Exception:
+        logger.exception("处理金十快讯失败")
 
 
 def init() -> None:

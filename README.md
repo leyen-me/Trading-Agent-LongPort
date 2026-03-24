@@ -94,3 +94,8 @@ docker run --rm -it \
 - 当前项目主要围绕单一交易标的运行
 - 盘中未注入通用衍生品持仓信息，避免误用 `stock_positions`
 - 自动复盘基于“长时间未收到新的确认 K 线”这一规则触发
+
+
+## 下载容器日志
+
+docker cp <容器 ID>:/app/.agent ./local_data && tar czf local_data.tar.gz local_data

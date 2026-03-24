@@ -75,3 +75,7 @@ class Config:
     DEFAULT_ACCOUNT_BALANCE_CURRENCY = (
         os.getenv("DEFAULT_ACCOUNT_BALANCE_CURRENCY", "USD").strip().upper() or "USD"
     )
+    # 金十快讯推送：1/true 启用，0/false 关闭
+    JIN10_ENABLED = format_bool(os.getenv("JIN10_ENABLED", "0"))
+    # 金十快讯拉取间隔（秒）
+    JIN10_INTERVAL = _optional_int("JIN10_INTERVAL") or 60

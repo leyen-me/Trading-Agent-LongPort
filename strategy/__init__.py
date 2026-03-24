@@ -1,0 +1,1 @@
+from .day_trading import init as init_day_trading

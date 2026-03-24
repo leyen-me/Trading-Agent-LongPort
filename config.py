@@ -2,6 +2,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+# 项目根目录，供各策略统一引用（config 位于根目录）
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def get_strategy_runtime_dir(strategy_name: str) -> Path:
+    """各策略的运行时目录（.agent/{strategy_name}/），互不干扰。"""
+    return PROJECT_ROOT / ".agent" / strategy_name
+
 
 def format_bool(s: str):
     """将字符串转换为布尔值"""

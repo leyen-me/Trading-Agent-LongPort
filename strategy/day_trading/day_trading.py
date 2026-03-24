@@ -19,7 +19,7 @@ from openai import OpenAI
 from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config as LongPortConfig, TradeSessions
 
 # self defined
-from config import Config
+from config import Config, PROJECT_ROOT, get_strategy_runtime_dir
 from utils import pack_candlesticks, pack_quotes, parse_adjust_type, parse_period
 from push_module import Jin10NewsPusher
 from utils.longport_trade_utils import pack_orders
@@ -60,9 +60,9 @@ _MUTATING_TRADE_TOOL_CLASSES = (
 
 # ==== 日志配置 ====
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-TRADING_PHILOSOPHY_FILE = SCRIPT_DIR / "trading_philosophy.md"
-_AGENT_DIR = SCRIPT_DIR / ".agent"
+STRATEGY_NAME = "day_trading"
+TRADING_PHILOSOPHY_FILE = Path(__file__).resolve().parent / "day_trading_philosophy.md"
+_AGENT_DIR = get_strategy_runtime_dir(STRATEGY_NAME)
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _HISTORY_FILE = _AGENT_DIR / "history.json"
 _LOG_FILE = _AGENT_DIR / "agent.log"

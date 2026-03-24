@@ -81,6 +81,8 @@ post_close_review_timer: Optional[threading.Timer] = None
 last_candlestick_monotonic: Optional[float] = None
 last_candlestick_trade_date: Optional[str] = None
 last_post_close_review_trade_date: Optional[str] = None
+# 每天第一根 K 线是交易所连通信号，非真实 K 线；记录已跳过该信号的日期
+_first_push_skipped_for_date: Optional[str] = None
 
 PREMARKET_INIT_HOUR = 9
 PREMARKET_INIT_MINUTE = 0
@@ -482,6 +484,7 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
     """每日 09:00 后执行一次日切，并在成功时刷新低频市场背景。"""
     global day_candlestick_count, daily_market_context
     global last_daily_reset_date, last_daily_context_refresh_date
+    global _first_push_skipped_for_date
     if quote_ctx is None or trading_agent is None:
         return False
 
@@ -505,6 +508,7 @@ def initialize_trading_day_if_needed(*, force: bool = False) -> bool:
             day_candlestick_count = 0
             daily_market_context = {}
             last_daily_reset_date = today
+            _first_push_skipped_for_date = None
             _cancel_post_close_review_timer()
             did_reset = True
 
@@ -1290,13 +1294,18 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
 
 
 def on_candlestick(symbol: str, event: PushCandlestick):
-    global day_candlestick_count
+    global day_candlestick_count, _first_push_skipped_for_date
     try:
         if not event.is_confirmed:
             return
 
         initialize_trading_day_if_needed()
         trade_date_text = event.candlestick.timestamp.strftime("%Y-%m-%d")
+
+        # 每天第一根 K 线是交易所连通信号，非真实 K 线，跳过不处理
+        if _first_push_skipped_for_date != trade_date_text:
+            _first_push_skipped_for_date = trade_date_text
+            return
         _refresh_post_close_review_timer(trade_date_text)
         day_candlestick_count += 1
 

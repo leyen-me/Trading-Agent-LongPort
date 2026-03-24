@@ -21,7 +21,6 @@ from longport.openapi import PushCandlestick, TradeContext, QuoteContext, Config
 # self defined
 from config import Config, PROJECT_ROOT, get_strategy_runtime_dir
 from utils import pack_candlesticks, pack_quotes, parse_adjust_type, parse_period
-from push_module import Jin10NewsPusher
 from utils.longport_trade_utils import pack_orders
 from tools import (
     BaseTool,
@@ -290,6 +289,7 @@ def build_trading_agent_system_prompt() -> str:
   <hard_constraints>
     <rule>你只能调用已注册工具；不要虚构行情、成交或账户状态。</rule>
     <rule>工具失败时不要假装成功；可重试、调整方案，或明确说明失败原因。</rule>
+    <rule>不要把无关标的的订单、成交或持仓当作 QQQ 交易依据。</rule>
   </hard_constraints>
 
   <available_tools>
@@ -321,11 +321,19 @@ def build_trading_agent_system_prompt() -> str:
     <rule>未完成必要工具调用前避免冗长臆测性总结。</rule>
     <rule>盘后复盘或修订交易思想时，请使用 trading_philosophy 更新交易思想文件。</rule>
     <rule>只总结与当前交易标的直接相关的订单、持仓与执行结果；其他标的除非有明确影响，否则不要展开。</rule>
+    <rule>盘中先判断今天更接近趋势、区间还是过渡，再决定顺势、区间反向或观望；不要跳过分类直接给交易建议。</rule>
+    <rule>最新由外部事件注入的确认 5 分钟 K 线，是当前 bar 的最高优先级事实；若和查询工具快照冲突，优先使用该确认 K 线，并把工具结果视为可能延迟。</rule>
+    <rule>盘中默认不要在每一根新 K 线上重复调用 quote_candlesticks 或 quote_realtime；只有在准备下单、核对关键位、或怀疑数据缺失时再调用工具。</rule>
+    <rule>盘后复盘优先使用 trade_today_orders、trade_stock_positions、trade_account_balance 获取事实；只有需要补充细节时再使用 trade_history_orders。</rule>
   </tool_call_policy>
 
   <output_contract>
     <rule>在工具结果已覆盖关键事实后，给出简洁、可核对的结论。</rule>
     <rule>盘中常规响应默认限制在 3-6 条短要点内；除非明确需要，不要输出表格、重复模板和大段免责声明。</rule>
+    <rule>盘中回答默认按以下顺序组织：日内分类 -> 关键位/结构 -> 行动或观望 -> 失效条件。</rule>
+    <rule>没有明显优势时，明确给出观望；不要为了“给建议”而制造建议。</rule>
+    <rule>不要在每轮结尾机械询问是否需要期权链信息；只有当用户明确要求，或结构、方向、时机都清晰且下一步确实应选合约时，才提议进入期权链工具流程。</rule>
+    <rule>若模型输出 reasoning，保持内部 reasoning 简洁，不要把最终回答完整重写一遍。</rule>
   </output_contract>
 </system>
 """.strip()
@@ -558,13 +566,21 @@ def _build_post_close_review_prompt(trade_date_text: str) -> str:
     return f"""
 检测到 {trade_date_text} 交易日已经连续 {POST_CLOSE_IDLE_SECONDS // 60} 分钟未收到新的确认K线，可视为已收盘。
 
-请执行一次简洁、事实优先的收盘复盘：
+请执行一次简洁、事实优先的收盘复盘。
+
+先获取事实，工具优先顺序如下：
+1. 先用 trade_today_orders 查询今日订单。
+2. 再用 trade_stock_positions / trade_account_balance 核对仓位与账户状态。
+3. 只有在需要补充细节时，再用 trade_history_orders。
+
+输出只回答以下问题：
 1. 判断今天更接近趋势日、区间日还是过渡日。
 2. 总结 5 分钟结构演化、关键价位与 4 小时语境的关系。
 3. 查询并总结今日订单、成交/撤单/拒单等执行结果。
 4. 评估今天的执行是否符合 trading_philosophy。
 5. 给出下一个交易日最值得关注的观察点。
 
+默认控制在 5 条以内的事实要点；不要写成长篇模板或大表格。
 只有在确有必要修订交易思想时，才调用 trading_philosophy 工具覆盖写入完整文件；否则不要改文件。
 """.strip()
 
@@ -1270,8 +1286,6 @@ def _build_trade_snapshot_text(trigger_symbol: str) -> str:
     except Exception as exc:
         snapshot["orders"] = {"error": str(exc)}
 
-    snapshot["positions_notice"] = "未注入持仓信息：当前仅接入 stock_positions，无法准确代表衍生品持仓。"
-
     return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1287,6 +1301,8 @@ def on_candlestick(symbol: str, event: PushCandlestick):
         day_candlestick_count += 1
 
         NEW_CANDLESTICK_TEXT = f"""
+    【盘中事件】以下是最新确认的 5 分钟 K 线，视为当前 bar 的最高优先级事实；若与工具快照有细微冲突，以本条为准。
+    请先判断当前更接近趋势、区间还是过渡；若没有新增边际，只更新关键位、行动与失效条件，不要重复整套长报告。
     【时间】：{event.candlestick.timestamp.strftime("%Y-%m-%d %H:%M:%S")}，当前是今日的第{day_candlestick_count}根K线。
     【OHLC】：{event.candlestick.open} {event.candlestick.high} {event.candlestick.low} {event.candlestick.close}
     【成交量】：{event.candlestick.volume}
@@ -1298,25 +1314,6 @@ def on_candlestick(symbol: str, event: PushCandlestick):
         logger.exception("处理 K 线回调失败: %s", symbol)
 
 
-def on_jin10_news(items: List[Dict[str, Any]]) -> None:
-    """接收金十快讯推送，汇总后注入 agent。"""
-    try:
-        if not items or trading_agent is None:
-            return
-        lines = []
-        for i, item in enumerate(items[:5], 1):  # 最多 5 条，避免上下文过长
-            content = (item.get("data") or {}).get("content", "")
-            if content:
-                lines.append(f"{i}. {content[:200]}{'...' if len(content) > 200 else ''}")
-        if not lines:
-            return
-        text = "【金十快讯】收到新快讯：\n" + "\n".join(lines)
-        with _agent_operation_lock:
-            trading_agent.chat(text, silent=True)
-    except Exception:
-        logger.exception("处理金十快讯失败")
-
-
 def init() -> None:
     global trade_ctx, quote_ctx, trading_agent
     quote_ctx = QuoteContext(LongPortConfig.from_env())
@@ -1326,8 +1323,3 @@ def init() -> None:
 
     quote_ctx.set_on_candlestick(on_candlestick)
     quote_ctx.subscribe_candlesticks(Config.TRADE_SYMBOL, parse_period(Config.TRADE_CYCLE), TradeSessions.Intraday)
-
-    if Config.JIN10_ENABLED:
-        jin10_pusher = Jin10NewsPusher(interval_seconds=Config.JIN10_INTERVAL)
-        jin10_pusher.set_on_news(on_jin10_news)
-        jin10_pusher.start()
